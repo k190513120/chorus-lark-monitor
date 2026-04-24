@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+: "${LARK_APP_ID:?LARK_APP_ID is required}"
+: "${LARK_APP_SECRET:?LARK_APP_SECRET is required}"
+: "${LARK_BASE_URL:?LARK_BASE_URL is required}"
+
+python3 sync_feishu_groups_to_base.py \
+  --scheduled-daily \
+  --refresh-metadata-tables \
+  --chat-order created_desc \
+  "$@"

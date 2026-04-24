@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>群消息监控 · Chorus</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+SC:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    /* warm palette */
+    --bg:            oklch(0.985 0.006 60);
+    --bg-elev:       oklch(1 0 0);
+    --bg-sunk:       oklch(0.965 0.008 60);
+    --line:          oklch(0.92 0.01 60);
+    --line-strong:   oklch(0.86 0.012 60);
+    --ink:           oklch(0.22 0.015 60);
+    --ink-2:         oklch(0.42 0.012 60);
+    --ink-3:         oklch(0.58 0.01 60);
+    --ink-4:         oklch(0.72 0.008 60);
+
+    --accent:        oklch(0.68 0.13 45);     /* terracotta */
+    --accent-ink:    oklch(0.38 0.11 45);
+    --accent-soft:   oklch(0.95 0.03 45);
+
+    --sage:          oklch(0.70 0.08 155);
+    --sage-soft:     oklch(0.95 0.025 155);
+
+    --amber:         oklch(0.78 0.14 75);
+    --amber-soft:    oklch(0.96 0.05 75);
+
+    --rose:          oklch(0.72 0.13 20);
+    --rose-soft:     oklch(0.96 0.035 20);
+
+    --sky:           oklch(0.72 0.09 235);
+    --sky-soft:      oklch(0.96 0.025 235);
+
+    --violet:        oklch(0.70 0.10 300);
+    --violet-soft:   oklch(0.96 0.03 300);
+
+    --r-sm: 10px;
+    --r:    14px;
+    --r-lg: 18px;
+    --r-xl: 24px;
+
+    --sh-1: 0 1px 2px oklch(0.3 0.02 60 / 0.05);
+    --sh-2: 0 4px 14px oklch(0.3 0.02 60 / 0.06), 0 1px 3px oklch(0.3 0.02 60 / 0.05);
+    --sh-3: 0 20px 48px oklch(0.3 0.02 60 / 0.12), 0 4px 12px oklch(0.3 0.02 60 / 0.06);
+
+    --font-cn: "Noto Sans SC", system-ui, -apple-system, sans-serif;
+    --font-num: "Inter", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  }
+
+  /* cool dark variant - set via [data-theme="dark"] */
+  [data-theme="dark"] {
+    --bg:            oklch(0.22 0.012 260);
+    --bg-elev:       oklch(0.26 0.014 260);
+    --bg-sunk:       oklch(0.19 0.012 260);
+    --line:          oklch(0.32 0.014 260);
+    --line-strong:   oklch(0.40 0.016 260);
+    --ink:           oklch(0.96 0.005 260);
+    --ink-2:         oklch(0.82 0.008 260);
+    --ink-3:         oklch(0.66 0.01 260);
+    --ink-4:         oklch(0.50 0.012 260);
+    --accent-soft:   oklch(0.32 0.06 45);
+    --sage-soft:     oklch(0.30 0.05 155);
+    --amber-soft:    oklch(0.34 0.08 75);
+    --rose-soft:     oklch(0.32 0.07 20);
+    --sky-soft:      oklch(0.30 0.05 235);
+    --violet-soft:   oklch(0.30 0.06 300);
+  }
+
+  /* cool variant */
+  [data-tone="cool"] {
+    --bg:            oklch(0.985 0.005 240);
+    --bg-elev:       oklch(1 0 0);
+    --bg-sunk:       oklch(0.965 0.008 240);
+    --line:          oklch(0.92 0.01 240);
+    --line-strong:   oklch(0.86 0.012 240);
+    --ink:           oklch(0.22 0.015 250);
+    --ink-2:         oklch(0.42 0.012 250);
+    --ink-3:         oklch(0.58 0.01 250);
+    --ink-4:         oklch(0.72 0.008 240);
+    --accent:        oklch(0.65 0.14 245);
+    --accent-ink:   oklch(0.38 0.12 245);
+    --accent-soft:   oklch(0.95 0.03 245);
+  }
+
+  [data-radius="tight"] { --r-sm:6px; --r:8px; --r-lg:10px; --r-xl:14px; }
+  [data-radius="pillowy"] { --r-sm:14px; --r:20px; --r-lg:26px; --r-xl:34px; }
+
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; }
+  body {
+    font-family: var(--font-cn);
+    background: var(--bg);
+    color: var(--ink);
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    letter-spacing: 0.005em;
+  }
+  .num, .metric-val { font-family: var(--font-num); font-feature-settings: "tnum" 1, "ss01" 1; letter-spacing: -0.01em; }
+  .mono { font-family: var(--font-mono); }
+
+  button, input, textarea, select { font: inherit; color: inherit; }
+  button { cursor: pointer; border: none; background: none; padding: 0; }
+  input, textarea { outline: none; }
+
+  /* scrollbar */
+  .scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+  .scroll::-webkit-scrollbar-track { background: transparent; }
+  .scroll::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 99px; border: 2px solid var(--bg); }
+  .scroll::-webkit-scrollbar-thumb:hover { background: var(--ink-4); }
+
+  #root { min-height: 100vh; }
+</style>
+
+<script type="application/json" id="__app_config">
+{ "placeholder": true }
+</script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="src/data.jsx"></script>
+  <script type="text/babel" src="src/icons.jsx"></script>
+  <script type="text/babel" src="src/ui.jsx"></script>
+  <script type="text/babel" src="src/stats.jsx"></script>
+  <script type="text/babel" src="src/grouplist.jsx"></script>
+  <script type="text/babel" src="src/detail.jsx"></script>
+  <script type="text/babel" src="src/broadcast.jsx"></script>
+  <script type="text/babel" src="src/tweaks.jsx"></script>
+  <script type="text/babel" src="src/app.jsx"></script>
+</body>
+</html>

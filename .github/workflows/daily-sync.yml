@@ -1,0 +1,51 @@
+name: Daily Feishu Sync
+
+on:
+  schedule:
+    # 北京时间 10:00 = UTC 02:00
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-feishu-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run daily sync
+        env:
+          LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
+          LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
+          LARK_BASE_URL: ${{ secrets.LARK_BASE_URL }}
+        run: ./run_daily_sync.sh
+
+      - name: Regenerate frontend data.jsx
+        env:
+          LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
+          LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
+          LARK_BASE_URL: ${{ secrets.LARK_BASE_URL }}
+          WEB_MAX_GROUPS: ${{ vars.WEB_MAX_GROUPS || '150' }}
+        run: python3 export_to_web.py
+
+      - name: Commit state and data.jsx
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .sync_state.json web/src/data.jsx
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: daily sync $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
