@@ -5,6 +5,11 @@ on:
     # 北京时间 10:00 = UTC 02:00
     - cron: '0 2 * * *'
   workflow_dispatch:
+    inputs:
+      max_chats:
+        description: '最多同步多少个群（默认 500，0 或留空 = 不限制，注意 Actions 单 job 6h 上限）'
+        required: false
+        default: '500'
 
 permissions:
   contents: write
@@ -28,7 +33,14 @@ jobs:
           LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
           LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
           LARK_BASE_URL: ${{ secrets.LARK_BASE_URL }}
-        run: ./run_daily_sync.sh
+          MAX_CHATS: ${{ github.event.inputs.max_chats || vars.MAX_CHATS_PER_RUN || '500' }}
+        run: |
+          EXTRA_ARGS=""
+          if [ -n "$MAX_CHATS" ] && [ "$MAX_CHATS" != "0" ]; then
+            EXTRA_ARGS="--max-chats $MAX_CHATS"
+          fi
+          echo "Running with: $EXTRA_ARGS"
+          ./run_daily_sync.sh $EXTRA_ARGS
 
       - name: Regenerate frontend data.jsx
         env:
