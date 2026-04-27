@@ -74,11 +74,13 @@ python3 sync_feishu_groups_to_base.py --chat-order created_desc --max-chats 10 -
 export LARK_APP_ID='...'
 export LARK_APP_SECRET='...'
 export LARK_BASE_URL='...'
-export WEB_MAX_GROUPS=150   # 可选，默认 200
+export WEB_MAX_GROUPS=0                 # 可选，默认 0 = 全部群
+export WEB_MAX_MESSAGES_PER_GROUP=0     # 可选，默认 0 = 每群全部消息
+export SYNC_TIMEZONE=Asia/Shanghai      # 可选，默认北京时间
 python3 export_to_web.py
 ```
 
-会重写 `web/src/data.jsx`，按 `消息数 → 成员数` 排序截取前 N 个群。
+会重写 `web/src/data.jsx`，按 `消息数 → 成员数` 排序；`WEB_MAX_GROUPS=0` 时导出全部群。
 
 ### 本地查看
 
@@ -105,10 +107,13 @@ python3 export_to_web.py
 - `--max-chats`：最多同步多少个群
 - `--max-messages-per-chat`：每个群最多同步多少条消息
 - `--chat-order`：按群创建时间排序，支持 `created_asc` / `created_desc`
+- `--sync-timezone`：日期窗口使用的时区，默认 `Asia/Shanghai`
 - `--scheduled-daily`：启用定时增量模式，自动用本地状态文件记住上次同步位置
+- `--scheduled-baseline`：定时任务首次进入新群范围时从哪里开始，默认 `today`，即从北京时间当天 00:00 开始补一次
 - `--state-file`：定时增量模式的本地状态文件路径
 - `--initial-lookback-hours`：首次没有状态文件时，往前回看多少小时
 - `--refresh-metadata-tables`：每天刷新群表和成员表快照，但保留消息历史表
+- `--skip-share-links`：不请求每个群的进群链接，适合全量群每日同步，减少 API 调用
 - `--recreate-tables`：删除同名同步表并重建
 - `--verbose`：输出更多调试日志
 
@@ -130,6 +135,7 @@ python3 export_to_web.py
 1. 先用 `--max-chats` 做小样本验证。
 2. 再按 `--skip-chats` 分批跑。
 3. 或者先加 `--start` / `--end` 限定时间范围。
+4. 日常任务推荐跑“全量群 + 当天起的消息增量”，这是当前 `run_daily_sync.sh` 的默认策略。
 
 ## 定时任务建议
 
@@ -142,9 +148,9 @@ python3 export_to_web.py
 它会：
 
 - 用本地 `.sync_state.json` 记录上次成功同步到的时间
-- 下次从 `上次成功结束时间 + 1秒` 继续拉消息（避免边界重复）
+- 第一次进入新的群范围时，从北京时间当天 00:00 开始补一次消息；之后从 `上次成功结束时间 + 1秒` 继续拉（避免边界重复）
 - 写入消息前预读消息表的 `消息ID` 集合做去重兜底（避免上次部分失败导致的重复）
-- 默认每天刷新 `机器人群列表` 和 `机器人群成员记录`
+- 默认覆盖应用机器人所在全部群，刷新 `机器人群列表` 和 `机器人群成员记录`
 - 保留 `机器人群消息记录` 的历史增量数据
 
 ### Cloudflare Pages 部署
@@ -175,7 +181,7 @@ python3 export_to_web.py
    - 提交更新后的 `.sync_state.json`（增量记忆）
    - 跑 `export_to_web.py` 重新生成 `web/src/data.jsx` 并一起提交
    - 后者触发 Cloudflare Pages 自动重建
-4. 可选：`Settings` → `Secrets and variables` → `Actions` → `Variables` 里加 `WEB_MAX_GROUPS` 控制前端最多展示的群数（默认 150）
+4. 可选：`Settings` → `Secrets and variables` → `Actions` → `Variables` 里加 `WEB_MAX_GROUPS` 控制前端最多展示的群数（默认 `0`，即全部群），加 `WEB_MAX_MESSAGES_PER_GROUP` 控制每群展示消息数（默认 `0`，即全部消息）
 5. 在 `Actions` 页可以手动 `Run workflow` 触发一次跑通验证
 
 注意：GitHub Actions 的 cron 偶尔会延迟几分钟，并非严格 10:00。

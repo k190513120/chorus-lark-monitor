@@ -9,8 +9,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Dict, Iterable, List, Optional
+from zoneinfo import ZoneInfo
 
 
 CHAT_TABLE_NAME = "机器人群列表"
@@ -99,6 +100,21 @@ class FeishuAPIError(RuntimeError):
 
 TOKEN_EXPIRED_CODES = {99991663, 99991664, 99991668, 99991677}
 TOKEN_REFRESH_INTERVAL_SECONDS = 5400  # refresh every 1.5h, tokens expire at 2h
+
+
+def int_value(value: object, default: int = 0) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def chat_scope_signature(max_chats: Optional[int], skip_chats: int) -> str:
+    if max_chats is None and skip_chats == 0:
+        return "all"
+    return f"skip:{skip_chats}:max:{max_chats if max_chats is not None else 'all'}"
 
 
 class FeishuClient:
@@ -223,7 +239,6 @@ class FeishuClient:
     ) -> List[Dict[str, object]]:
         items: List[Dict[str, object]] = []
         page_token = None
-        skipped = 0
         while True:
             params = {
                 "page_size": min(page_size, 100),
@@ -233,24 +248,23 @@ class FeishuClient:
                 params["page_token"] = page_token
             data = self.request("GET", "/open-apis/im/v1/chats", params=params)
             batch = list(data.get("items") or [])
-            if created_desc:
-                batch.reverse()
-            if skip_chats and skipped < skip_chats:
-                remaining = skip_chats - skipped
-                if remaining >= len(batch):
-                    skipped += len(batch)
-                    batch = []
-                else:
-                    batch = batch[remaining:]
-                    skipped += remaining
             items.extend(batch)
-            if max_chats is not None and len(items) >= max_chats:
-                return items[:max_chats]
             if not data.get("has_more"):
-                return items
+                break
             page_token = data.get("page_token")
             if not page_token:
-                return items
+                break
+
+        if created_desc:
+            if any(int_value(item.get("create_time")) for item in items):
+                items.sort(key=lambda item: int_value(item.get("create_time")), reverse=True)
+            else:
+                items.reverse()
+        if skip_chats:
+            items = items[skip_chats:]
+        if max_chats is not None:
+            items = items[:max_chats]
+        return items
 
     def iter_messages(
         self,
@@ -521,9 +535,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start")
     parser.add_argument("--end")
     parser.add_argument(
+        "--sync-timezone",
+        default=os.getenv("SYNC_TIMEZONE", "Asia/Shanghai"),
+        help="Timezone used for date-only windows and scheduled daily baselines.",
+    )
+    parser.add_argument(
         "--scheduled-daily",
         action="store_true",
         help="Run as a daily incremental sync using a local state file.",
+    )
+    parser.add_argument(
+        "--scheduled-baseline",
+        choices=["today", "state"],
+        default=os.getenv("SCHEDULED_BASELINE", "today"),
+        help=(
+            "When scheduled state does not match the current chat scope, "
+            "'today' starts from local midnight once; 'state' only follows the saved state."
+        ),
     )
     parser.add_argument(
         "--state-file",
@@ -540,6 +568,22 @@ def parse_args() -> argparse.Namespace:
         "--refresh-metadata-tables",
         action="store_true",
         help="Rebuild chat/member snapshot tables while keeping message history table.",
+    )
+    parser.add_argument(
+        "--skip-share-links",
+        action="store_true",
+        help="Do not request per-chat share links. Useful for full-scope daily syncs.",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Read-only check: list chats and sample chat members/messages without writing Base records.",
+    )
+    parser.add_argument(
+        "--smoke-test-detail-chats",
+        type=int,
+        default=5,
+        help="How many chats to sample in --smoke-test mode.",
     )
     parser.add_argument(
         "--chat-order",
@@ -585,10 +629,28 @@ def parse_base_token(base_url: str) -> str:
     return token
 
 
-def parse_time_to_epoch_seconds(value: Optional[str], *, end_of_day: bool = False) -> Optional[int]:
+def load_timezone(name: str) -> tzinfo:
+    try:
+        return ZoneInfo(name)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"unsupported timezone: {name}") from exc
+
+
+def today_start_epoch_seconds(tzinfo: tzinfo) -> int:
+    now = datetime.now(tzinfo)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp())
+
+
+def parse_time_to_epoch_seconds(
+    value: Optional[str],
+    *,
+    end_of_day: bool = False,
+    tzinfo: Optional[tzinfo] = None,
+) -> Optional[int]:
     if not value:
         return None
-    local_tz = datetime.now().astimezone().tzinfo or timezone(timedelta(hours=8))
+    local_tz = tzinfo or datetime.now().astimezone().tzinfo or timezone(timedelta(hours=8))
 
     dt: Optional[datetime] = None
     value = value.strip()
@@ -607,8 +669,8 @@ def parse_time_to_epoch_seconds(value: Optional[str], *, end_of_day: bool = Fals
     return int(dt.timestamp())
 
 
-def epoch_seconds_to_iso(value: int) -> str:
-    dt = datetime.fromtimestamp(value, tz=datetime.now().astimezone().tzinfo)
+def epoch_seconds_to_iso(value: int, tzinfo: Optional[tzinfo] = None) -> str:
+    dt = datetime.fromtimestamp(value, tz=tzinfo or datetime.now().astimezone().tzinfo)
     return dt.isoformat()
 
 
@@ -629,25 +691,25 @@ def save_state(path: str, payload: Dict[str, object]) -> None:
     shutil.move(tmp_path, path)
 
 
-def epoch_millis_to_text(value: object) -> str:
+def epoch_millis_to_text(value: object, tzinfo: Optional[tzinfo] = None) -> str:
     if value in (None, ""):
         return ""
     try:
         millis = int(str(value))
     except ValueError:
         return str(value)
-    dt = datetime.fromtimestamp(millis / 1000, tz=datetime.now().astimezone().tzinfo)
+    dt = datetime.fromtimestamp(millis / 1000, tz=tzinfo or datetime.now().astimezone().tzinfo)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def epoch_seconds_to_text(value: object) -> str:
+def epoch_seconds_to_text(value: object, tzinfo: Optional[tzinfo] = None) -> str:
     if value in (None, ""):
         return ""
     try:
         seconds = int(str(value))
     except ValueError:
         return str(value)
-    dt = datetime.fromtimestamp(seconds, tz=datetime.now().astimezone().tzinfo)
+    dt = datetime.fromtimestamp(seconds, tz=tzinfo or datetime.now().astimezone().tzinfo)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -931,6 +993,7 @@ def build_chat_row(
     member_total: int,
     sync_run_id: str,
     sync_time_text: str,
+    sync_tz: tzinfo,
 ) -> List[str]:
     link_error = stringify(share_link.get("_error"))
     owner_id = stringify(detail.get("owner_id") or chat.get("owner_id"))
@@ -955,7 +1018,7 @@ def build_chat_row(
         build_member_summary(members, member_total),
         stringify(share_link.get("share_link")),
         stringify(share_link.get("is_permanent")),
-        epoch_seconds_to_text(share_link.get("expire_time")),
+        epoch_seconds_to_text(share_link.get("expire_time"), sync_tz),
         link_error,
         stringify(detail.get("tenant_key") or chat.get("tenant_key")),
         stringify(detail.get("avatar") or chat.get("avatar")),
@@ -996,6 +1059,7 @@ def build_message_row(
     chat_name: str,
     chat_record_id: str,
     sync_run_id: str,
+    sync_tz: tzinfo,
 ) -> List[object]:
     sender = message.get("sender") if isinstance(message.get("sender"), dict) else {}
     body = message.get("body") if isinstance(message.get("body"), dict) else {}
@@ -1010,8 +1074,8 @@ def build_message_row(
         chat_name,
         [{"id": chat_record_id}],
         stringify(message.get("msg_type")),
-        epoch_millis_to_text(message.get("create_time")),
-        epoch_millis_to_text(message.get("update_time")),
+        epoch_millis_to_text(message.get("create_time"), sync_tz),
+        epoch_millis_to_text(message.get("update_time"), sync_tz),
         sender_id,
         sender_id_type,
         user_cell(sender_id, sender_id_type) if sender_type == "user" else None,
@@ -1043,27 +1107,52 @@ def build_member_summary(members: List[Dict[str, object]], member_total: int, li
 def main() -> int:
     args = parse_args()
     base_token = parse_base_token(args.base_url)
+    sync_tz = load_timezone(args.sync_timezone)
     scheduled_window = None
-    start_time = parse_time_to_epoch_seconds(args.start)
-    end_time = parse_time_to_epoch_seconds(args.end, end_of_day=True)
+    start_time = parse_time_to_epoch_seconds(args.start, tzinfo=sync_tz)
+    end_time = parse_time_to_epoch_seconds(args.end, end_of_day=True, tzinfo=sync_tz)
     if args.scheduled_daily:
         state = load_state(args.state_file)
         now_ts = int(time.time())
-        previous_end = state.get("last_success_end_time")
-        if isinstance(previous_end, int) and previous_end > 0:
+        previous_end = int_value(state.get("last_success_end_time"))
+        current_chat_scope = chat_scope_signature(args.max_chats, args.skip_chats)
+        previous_chat_scope = stringify(state.get("chat_scope"))
+        baseline_start = today_start_epoch_seconds(sync_tz)
+        baseline_reason = "explicit_start" if start_time is not None else ""
+
+        if start_time is not None:
+            pass
+        elif (
+            args.scheduled_baseline == "today"
+            and previous_chat_scope != current_chat_scope
+        ):
+            start_time = baseline_start
+            baseline_reason = "chat_scope_changed_or_missing"
+        elif previous_end > 0:
             start_time = previous_end + 1
+            baseline_reason = "state"
+        elif args.scheduled_baseline == "today":
+            start_time = baseline_start
+            baseline_reason = "missing_state_today"
         else:
             start_time = max(0, now_ts - args.initial_lookback_hours * 3600)
-        end_time = now_ts
+            baseline_reason = "missing_state_lookback"
+        if end_time is None:
+            end_time = now_ts
         args.chat_order = "created_desc"
         scheduled_window = {
             "state_file": args.state_file,
             "last_success_end_time": previous_end,
             "current_start_time": start_time,
             "current_end_time": end_time,
+            "chat_scope": current_chat_scope,
+            "previous_chat_scope": previous_chat_scope,
+            "scheduled_baseline": args.scheduled_baseline,
+            "baseline_reason": baseline_reason,
+            "sync_timezone": args.sync_timezone,
         }
-    sync_run_id = datetime.now().strftime("%Y%m%d%H%M%S")
-    sync_time_text = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    sync_run_id = datetime.now(sync_tz).strftime("%Y%m%d%H%M%S")
+    sync_time_text = datetime.now(sync_tz).strftime("%Y-%m-%d %H:%M:%S")
 
     client = FeishuClient(args.app_id, args.app_secret, verbose=args.verbose)
     client.authenticate()
@@ -1075,7 +1164,7 @@ def main() -> int:
     if args.scheduled_daily:
         print(
             "定时模式增量窗口: "
-            f"{epoch_seconds_to_iso(start_time)} -> {epoch_seconds_to_iso(end_time)}",
+            f"{epoch_seconds_to_iso(start_time, sync_tz)} -> {epoch_seconds_to_iso(end_time, sync_tz)}",
             file=sys.stderr,
         )
     chats = client.list_chats(
@@ -1085,6 +1174,51 @@ def main() -> int:
         created_desc=args.chat_order == "created_desc",
     )
     print(f"共获取到 {len(chats)} 个群聊。", file=sys.stderr)
+
+    if args.smoke_test:
+        sampled_chats = []
+        for chat in chats[:max(0, args.smoke_test_detail_chats)]:
+            chat_id = stringify(chat.get("chat_id"))
+            detail = client.get_chat_detail(chat_id)
+            members_payload = client.list_chat_members(chat_id)
+            messages = list(
+                client.iter_messages(
+                    chat_id,
+                    page_size=args.message_page_size,
+                    start_time=start_time,
+                    end_time=end_time,
+                    max_messages=args.max_messages_per_chat,
+                )
+            )
+            sampled_chats.append(
+                {
+                    "chat_id": chat_id,
+                    "name": stringify(detail.get("name") or chat.get("name")),
+                    "member_count": len(members_payload.get("items") or []),
+                    "member_total": int(members_payload.get("member_total") or 0),
+                    "message_count_in_window": len(messages),
+                }
+            )
+        print(
+            json.dumps(
+                {
+                    "smoke_test": True,
+                    "identity_source": client.identity_summary(),
+                    "chat_count": len(chats),
+                    "chat_scope": chat_scope_signature(args.max_chats, args.skip_chats),
+                    "sync_timezone": args.sync_timezone,
+                    "start_time": start_time,
+                    "start_time_iso": epoch_seconds_to_iso(start_time, sync_tz) if start_time else None,
+                    "end_time": end_time,
+                    "end_time_iso": epoch_seconds_to_iso(end_time, sync_tz) if end_time else None,
+                    "sampled_chat_count": len(sampled_chats),
+                    "sampled_chats": sampled_chats,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
 
     chat_table_id = ensure_table_and_fields(
         client,
@@ -1132,10 +1266,13 @@ def main() -> int:
         members_payload = client.list_chat_members(chat_id)
         members = list(members_payload.get("items") or [])
         member_total = int(members_payload.get("member_total") or len(members))
-        try:
-            share_link = client.get_chat_share_link(chat_id)
-        except Exception as exc:  # noqa: BLE001
-            share_link = {"_error": str(exc)}
+        if args.skip_share_links:
+            share_link = {}
+        else:
+            try:
+                share_link = client.get_chat_share_link(chat_id)
+            except Exception as exc:  # noqa: BLE001
+                share_link = {"_error": str(exc)}
 
         chat_name = stringify(detail.get("name") or chat.get("name"))
         chat_row = build_chat_row(
@@ -1146,6 +1283,7 @@ def main() -> int:
             member_total,
             sync_run_id,
             sync_time_text,
+            sync_tz,
         )
         chat_result = client.batch_create_records(base_token, chat_table_id, CHAT_FIELDS, [chat_row])
         chat_record_id_list = chat_result.get("record_id_list") or []
@@ -1187,7 +1325,7 @@ def main() -> int:
                 continue
             if message_id:
                 existing_message_ids.add(message_id)
-            message_batch.append(build_message_row(message, chat_name, chat_record_id, sync_run_id))
+            message_batch.append(build_message_row(message, chat_name, chat_record_id, sync_run_id, sync_tz))
             chat_message_count += 1
             total_messages += 1
             if len(message_batch) >= 200:
@@ -1229,6 +1367,8 @@ def main() -> int:
         "member_count": total_members,
         "message_count": total_messages,
         "chat_order": args.chat_order,
+        "chat_scope": chat_scope_signature(args.max_chats, args.skip_chats),
+        "sync_timezone": args.sync_timezone,
         "start_time": start_time,
         "end_time": end_time,
     }
@@ -1238,10 +1378,13 @@ def main() -> int:
             args.state_file,
             {
                 "last_success_end_time": end_time,
-                "last_success_end_iso": epoch_seconds_to_iso(end_time),
+                "last_success_end_iso": epoch_seconds_to_iso(end_time, sync_tz),
                 "last_sync_run_id": sync_run_id,
                 "identity_source": client.identity_summary(),
                 "base_token": base_token,
+                "chat_scope": chat_scope_signature(args.max_chats, args.skip_chats),
+                "scheduled_baseline": args.scheduled_baseline,
+                "sync_timezone": args.sync_timezone,
             },
         )
     print(json.dumps(result, ensure_ascii=False, indent=2))

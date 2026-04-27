@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, tzinfo
 from typing import Dict, List, Optional
 
 from sync_feishu_groups_to_base import (
@@ -17,12 +17,14 @@ from sync_feishu_groups_to_base import (
     MESSAGE_TABLE_NAME,
     FeishuAPIError,
     FeishuClient,
+    load_timezone,
     parse_base_token,
 )
 
 
 CLIENT_SIDE_HUE_START = 15
-DEFAULT_MAX_GROUPS = 200
+DEFAULT_MAX_GROUPS = 0
+DEFAULT_MAX_MESSAGES_PER_GROUP = 0
 
 
 def extract_text(cell) -> str:
@@ -97,12 +99,12 @@ def avatar_for(name: str) -> Dict[str, str]:
     }
 
 
-def parse_datetime(text: str) -> Optional[int]:
+def parse_datetime(text: str, sync_tz: tzinfo) -> Optional[int]:
     if not text:
         return None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
-            dt = datetime.strptime(text[:19], fmt)
+            dt = datetime.strptime(text[:19], fmt).replace(tzinfo=sync_tz)
             return int(dt.timestamp() * 1000)
         except ValueError:
             continue
@@ -161,7 +163,7 @@ def pick_active_groups(chats: List[Dict], members_by_chat: Dict[str, List[Dict]]
         ),
         reverse=True,
     )
-    selected = ranked[:max_groups]
+    selected = ranked if max_groups <= 0 else ranked[:max_groups]
     return selected
 
 
@@ -212,7 +214,7 @@ def load_members(client: FeishuClient, base_token: str, table_id: str) -> Dict[s
     return members_by_chat
 
 
-def load_messages(client: FeishuClient, base_token: str, table_id: str) -> Dict[str, List[Dict]]:
+def load_messages(client: FeishuClient, base_token: str, table_id: str, sync_tz: tzinfo) -> Dict[str, List[Dict]]:
     raw = list_all_records(
         client, base_token, table_id,
         field_names=["消息ID", "群ID", "发送者ID", "发送者类型", "发送时间", "提取消息内容", "消息类型"],
@@ -224,7 +226,7 @@ def load_messages(client: FeishuClient, base_token: str, table_id: str) -> Dict[
         if not chat_id:
             continue
         text = extract_text(fields.get("提取消息内容")) or "[无内容]"
-        time_ms = parse_datetime(extract_text(fields.get("发送时间"))) or int(time.time() * 1000)
+        time_ms = parse_datetime(extract_text(fields.get("发送时间")), sync_tz) or int(time.time() * 1000)
         messages_by_chat[chat_id].append({
             "id": extract_text(fields.get("消息ID")),
             "sender_id": extract_text(fields.get("发送者ID")),
@@ -238,9 +240,15 @@ def load_messages(client: FeishuClient, base_token: str, table_id: str) -> Dict[
     return messages_by_chat
 
 
-def build_app_data(chats: List[Dict], members_by_chat: Dict[str, List[Dict]], messages_by_chat: Dict[str, List[Dict]]) -> Dict:
-    now_ms = int(time.time() * 1000)
-    today_start_ms = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+def build_app_data(
+    chats: List[Dict],
+    members_by_chat: Dict[str, List[Dict]],
+    messages_by_chat: Dict[str, List[Dict]],
+    sync_tz: tzinfo,
+    max_messages_per_group: int,
+) -> Dict:
+    now_ms = int(datetime.now(sync_tz).timestamp() * 1000)
+    today_start_ms = int(datetime.now(sync_tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
     week_start_ms = today_start_ms - 6 * 86400 * 1000
 
     # Determine team tenant: most common tenant_key across all members is assumed to be "our side"
@@ -308,7 +316,7 @@ def build_app_data(chats: List[Dict], members_by_chat: Dict[str, List[Dict]], me
             time_ms = m["time"]
             if time_ms >= today_start_ms:
                 today_msgs += 1
-                hour = datetime.fromtimestamp(time_ms / 1000).hour
+                hour = datetime.fromtimestamp(time_ms / 1000, tz=sync_tz).hour
                 hourly[hour] += 1
             if time_ms >= week_start_ms:
                 week_msgs += 1
@@ -334,7 +342,8 @@ def build_app_data(chats: List[Dict], members_by_chat: Dict[str, List[Dict]], me
                 "time": time_ms,
             })
 
-        display_messages = display_messages[-40:]
+        if max_messages_per_group > 0:
+            display_messages = display_messages[-max_messages_per_group:]
 
         last_minutes_ago = max(0, (now_ms - last_time) // 60000) if last_time else 24 * 60
         if last_client_client_time and last_client_client_time > last_team_reply_time:
@@ -523,7 +532,9 @@ def main() -> int:
     if not (app_id and app_secret and base_url):
         print("LARK_APP_ID / LARK_APP_SECRET / LARK_BASE_URL must be set", file=sys.stderr)
         return 2
+    sync_tz = load_timezone(os.getenv("SYNC_TIMEZONE", "Asia/Shanghai"))
     max_groups = int(os.getenv("WEB_MAX_GROUPS", str(DEFAULT_MAX_GROUPS)))
+    max_messages_per_group = int(os.getenv("WEB_MAX_MESSAGES_PER_GROUP", str(DEFAULT_MAX_MESSAGES_PER_GROUP)))
     output_path = os.getenv("WEB_DATA_OUTPUT", os.path.join(os.path.dirname(__file__), "web", "src", "data.jsx"))
 
     base_token = parse_base_token(base_url)
@@ -544,14 +555,15 @@ def main() -> int:
     print(f"  member rows: {sum(len(v) for v in members_by_chat.values())} (groups with members: {len(members_by_chat)})", file=sys.stderr)
 
     print("正在拉取消息记录...", file=sys.stderr)
-    messages_by_chat = load_messages(client, base_token, message_table_id)
+    messages_by_chat = load_messages(client, base_token, message_table_id, sync_tz)
     print(f"  message rows: {sum(len(v) for v in messages_by_chat.values())} (groups with messages: {len(messages_by_chat)})", file=sys.stderr)
 
-    print(f"正在筛选前 {max_groups} 个群（按消息数 → 成员数排序）...", file=sys.stderr)
+    group_scope_text = "全部群" if max_groups <= 0 else f"前 {max_groups} 个群"
+    print(f"正在筛选{group_scope_text}（按消息数 → 成员数排序）...", file=sys.stderr)
     selected = pick_active_groups(chats, members_by_chat, messages_by_chat, max_groups)
 
     print("正在构建 AppData...", file=sys.stderr)
-    payload = build_app_data(selected, members_by_chat, messages_by_chat)
+    payload = build_app_data(selected, members_by_chat, messages_by_chat, sync_tz, max_messages_per_group)
 
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -560,7 +572,7 @@ def main() -> int:
     member_count = sum(len(g["members"]) for g in payload["GROUPS"])
 
     content = DATA_TEMPLATE.format(
-        generated_at=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z"),
+        generated_at=datetime.now(sync_tz).strftime("%Y-%m-%d %H:%M:%S%z"),
         base_token=base_token,
         group_count=group_count,
         msg_count=msg_count,

@@ -7,9 +7,17 @@ on:
   workflow_dispatch:
     inputs:
       max_chats:
-        description: '最多同步多少个群（默认 500，0 或留空 = 不限制，注意 Actions 单 job 6h 上限）'
+        description: '最多同步多少个群（默认 0 = 不限制，覆盖应用机器人所在全部群；注意 Actions 单 job 6h 上限）'
         required: false
-        default: '500'
+        default: '0'
+      smoke_test:
+        description: '只读测试：列出群并抽样读取成员/消息，不写 Base、不部署'
+        required: false
+        default: 'false'
+      smoke_test_detail_chats:
+        description: '只读测试抽样读取多少个群'
+        required: false
+        default: '5'
 
 permissions:
   contents: write
@@ -33,24 +41,34 @@ jobs:
           LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
           LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
           LARK_BASE_URL: ${{ secrets.LARK_BASE_URL }}
-          MAX_CHATS: ${{ github.event.inputs.max_chats || vars.MAX_CHATS_PER_RUN || '500' }}
+          MAX_CHATS: ${{ github.event.inputs.max_chats || '0' }}
+          SMOKE_TEST: ${{ github.event.inputs.smoke_test || 'false' }}
+          SMOKE_TEST_DETAIL_CHATS: ${{ github.event.inputs.smoke_test_detail_chats || '5' }}
+          SYNC_TIMEZONE: Asia/Shanghai
         run: |
           EXTRA_ARGS=""
           if [ -n "$MAX_CHATS" ] && [ "$MAX_CHATS" != "0" ]; then
             EXTRA_ARGS="--max-chats $MAX_CHATS"
           fi
+          if [ "$SMOKE_TEST" = "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --smoke-test --smoke-test-detail-chats $SMOKE_TEST_DETAIL_CHATS"
+          fi
           echo "Running with: $EXTRA_ARGS"
           ./run_daily_sync.sh $EXTRA_ARGS
 
       - name: Regenerate frontend data.jsx
+        if: ${{ github.event.inputs.smoke_test != 'true' }}
         env:
           LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
           LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
           LARK_BASE_URL: ${{ secrets.LARK_BASE_URL }}
-          WEB_MAX_GROUPS: ${{ vars.WEB_MAX_GROUPS || '150' }}
+          WEB_MAX_GROUPS: ${{ vars.WEB_MAX_GROUPS || '0' }}
+          WEB_MAX_MESSAGES_PER_GROUP: ${{ vars.WEB_MAX_MESSAGES_PER_GROUP || '0' }}
+          SYNC_TIMEZONE: Asia/Shanghai
         run: python3 export_to_web.py
 
       - name: Commit state and data.jsx
+        if: ${{ github.event.inputs.smoke_test != 'true' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -63,6 +81,7 @@ jobs:
           fi
 
       - name: Deploy to Cloudflare Pages
+        if: ${{ github.event.inputs.smoke_test != 'true' }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}

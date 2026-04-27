@@ -11,5 +11,7 @@ cd "$SCRIPT_DIR"
 python3 sync_feishu_groups_to_base.py \
   --scheduled-daily \
   --refresh-metadata-tables \
+  --skip-share-links \
+  --sync-timezone "${SYNC_TIMEZONE:-Asia/Shanghai}" \
   --chat-order created_desc \
   "$@"
