@@ -587,7 +587,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sync-batch-size",
         type=int,
-        default=100,
+        default=200,
         help="Number of chats to read before batch-writing records. Max write batch remains 200.",
     )
     parser.add_argument(

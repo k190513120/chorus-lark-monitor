@@ -14,6 +14,7 @@ python3 sync_feishu_groups_to_base.py \
   --skip-share-links \
   --fast-metadata \
   --skip-groupchat-field-updates \
+  --sync-batch-size "${SYNC_BATCH_SIZE:-200}" \
   --sync-timezone "${SYNC_TIMEZONE:-Asia/Shanghai}" \
   --chat-order created_desc \
   "$@"
