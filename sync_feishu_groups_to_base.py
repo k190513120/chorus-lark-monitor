@@ -575,6 +575,22 @@ def parse_args() -> argparse.Namespace:
         help="Do not request per-chat share links. Useful for full-scope daily syncs.",
     )
     parser.add_argument(
+        "--fast-metadata",
+        action="store_true",
+        help="Use the chat list payload for chat metadata instead of requesting every chat detail.",
+    )
+    parser.add_argument(
+        "--skip-groupchat-field-updates",
+        action="store_true",
+        help="Skip optional native GroupChat field backfill; text fields and linked records are still written.",
+    )
+    parser.add_argument(
+        "--sync-batch-size",
+        type=int,
+        default=100,
+        help="Number of chats to read before batch-writing records. Max write batch remains 200.",
+    )
+    parser.add_argument(
         "--smoke-test",
         action="store_true",
         help="Read-only check: list chats and sample chat members/messages without writing Base records.",
@@ -1258,102 +1274,150 @@ def main() -> int:
     total_messages = 0
     total_members = 0
     total_chat_rows = 0
-    for index, chat in enumerate(chats, start=1):
-        chat_id = stringify(chat.get("chat_id"))
-        print(f"[{index}/{len(chats)}] 正在同步群资料: {stringify(chat.get('name'))} ({chat_id})", file=sys.stderr)
-
-        detail = client.get_chat_detail(chat_id)
-        members_payload = client.list_chat_members(chat_id)
-        members = list(members_payload.get("items") or [])
-        member_total = int(members_payload.get("member_total") or len(members))
-        if args.skip_share_links:
-            share_link = {}
-        else:
-            try:
-                share_link = client.get_chat_share_link(chat_id)
-            except Exception as exc:  # noqa: BLE001
-                share_link = {"_error": str(exc)}
-
-        chat_name = stringify(detail.get("name") or chat.get("name"))
-        chat_row = build_chat_row(
-            chat,
-            detail,
-            share_link,
-            members,
-            member_total,
-            sync_run_id,
-            sync_time_text,
-            sync_tz,
-        )
-        chat_result = client.batch_create_records(base_token, chat_table_id, CHAT_FIELDS, [chat_row])
-        chat_record_id_list = chat_result.get("record_id_list") or []
-        if not chat_record_id_list:
-            raise FeishuAPIError(f"failed to get record id for chat {chat_id}")
-        chat_record_id = str(chat_record_id_list[0])
-        client.batch_update_groupchat_fields_v1(base_token, chat_table_id, [chat_record_id], chat_id, chat_name)
-        total_chat_rows += 1
-
-        member_rows = build_member_rows(chat_id, chat_name, chat_record_id, members, sync_run_id)
-        for batch in chunked(member_rows, 200):
-            member_result = client.batch_create_records(base_token, member_table_id, member_fields, batch)
-            client.batch_update_groupchat_fields_v1(
-                base_token,
-                member_table_id,
-                [str(record_id) for record_id in (member_result.get("record_id_list") or [])],
-                chat_id,
-                chat_name,
-            )
-        total_members += len(member_rows)
-
+    processed_chats = 0
+    batch_size = max(1, min(args.sync_batch_size, 200))
+    for chat_batch in chunked(chats, batch_size):
+        batch_payloads: List[Dict[str, object]] = []
+        batch_start = processed_chats + 1
+        batch_end = processed_chats + len(chat_batch)
         print(
-            f"    群资料已写入，成员 {len(member_rows)} 人，开始同步消息。",
+            f"[{batch_start}-{batch_end}/{len(chats)}] 正在读取群、成员和消息...",
             file=sys.stderr,
         )
-        message_batch: List[List[str]] = []
-        chat_message_count = 0
-        chat_skipped_count = 0
-        for message in client.iter_messages(
-            chat_id,
-            page_size=args.message_page_size,
-            start_time=start_time,
-            end_time=end_time,
-            max_messages=args.max_messages_per_chat,
-        ):
-            message_id = stringify(message.get("message_id"))
-            if message_id and message_id in existing_message_ids:
-                chat_skipped_count += 1
-                continue
-            if message_id:
-                existing_message_ids.add(message_id)
-            message_batch.append(build_message_row(message, chat_name, chat_record_id, sync_run_id, sync_tz))
-            chat_message_count += 1
-            total_messages += 1
-            if len(message_batch) >= 200:
-                message_result = client.batch_create_records(base_token, message_table_id, message_fields, message_batch)
+
+        for chat in chat_batch:
+            chat_id = stringify(chat.get("chat_id"))
+            detail = dict(chat) if args.fast_metadata else client.get_chat_detail(chat_id)
+            members_payload = client.list_chat_members(chat_id)
+            members = list(members_payload.get("items") or [])
+            member_total = int(members_payload.get("member_total") or len(members))
+            if args.skip_share_links:
+                share_link = {}
+            else:
+                try:
+                    share_link = client.get_chat_share_link(chat_id)
+                except Exception as exc:  # noqa: BLE001
+                    share_link = {"_error": str(exc)}
+
+            chat_name = stringify(detail.get("name") or chat.get("name"))
+            chat_row = build_chat_row(
+                chat,
+                detail,
+                share_link,
+                members,
+                member_total,
+                sync_run_id,
+                sync_time_text,
+                sync_tz,
+            )
+            messages = list(
+                client.iter_messages(
+                    chat_id,
+                    page_size=args.message_page_size,
+                    start_time=start_time,
+                    end_time=end_time,
+                    max_messages=args.max_messages_per_chat,
+                )
+            )
+            batch_payloads.append(
+                {
+                    "chat_id": chat_id,
+                    "chat_name": chat_name,
+                    "chat_row": chat_row,
+                    "members": members,
+                    "messages": messages,
+                }
+            )
+
+        chat_rows = [payload["chat_row"] for payload in batch_payloads]
+        chat_result = client.batch_create_records(base_token, chat_table_id, CHAT_FIELDS, chat_rows)
+        chat_record_id_list = [str(record_id) for record_id in (chat_result.get("record_id_list") or [])]
+        if len(chat_record_id_list) != len(batch_payloads):
+            raise FeishuAPIError(
+                f"expected {len(batch_payloads)} chat record ids, got {len(chat_record_id_list)}"
+            )
+
+        member_rows_for_batch: List[List[object]] = []
+        message_rows_for_batch: List[List[object]] = []
+        batch_member_count = 0
+        batch_message_count = 0
+        batch_skipped_count = 0
+
+        for payload, chat_record_id in zip(batch_payloads, chat_record_id_list):
+            chat_id = str(payload["chat_id"])
+            chat_name = str(payload["chat_name"])
+            if not args.skip_groupchat_field_updates:
                 client.batch_update_groupchat_fields_v1(
                     base_token,
-                    message_table_id,
-                    [str(record_id) for record_id in (message_result.get("record_id_list") or [])],
+                    chat_table_id,
+                    [chat_record_id],
                     chat_id,
                     chat_name,
                 )
-                message_batch = []
-        if message_batch:
-            message_result = client.batch_create_records(base_token, message_table_id, message_fields, message_batch)
-            client.batch_update_groupchat_fields_v1(
-                base_token,
-                message_table_id,
-                [str(record_id) for record_id in (message_result.get("record_id_list") or [])],
+
+            member_rows = build_member_rows(
                 chat_id,
                 chat_name,
+                chat_record_id,
+                list(payload["members"]),
+                sync_run_id,
             )
-        if chat_skipped_count:
-            print(
-                f"    已写入 {chat_message_count} 条消息，跳过 {chat_skipped_count} 条已存在消息。",
-                file=sys.stderr,
-            )
+            payload["member_rows"] = member_rows
+            member_rows_for_batch.extend(member_rows)
+            batch_member_count += len(member_rows)
+
+            message_rows: List[List[object]] = []
+            for message in list(payload["messages"]):
+                message_id = stringify(message.get("message_id"))
+                if message_id and message_id in existing_message_ids:
+                    batch_skipped_count += 1
+                    continue
+                if message_id:
+                    existing_message_ids.add(message_id)
+                message_rows.append(build_message_row(message, chat_name, chat_record_id, sync_run_id, sync_tz))
+                batch_message_count += 1
+            payload["message_rows"] = message_rows
+            message_rows_for_batch.extend(message_rows)
+
+        if args.skip_groupchat_field_updates:
+            for batch in chunked(member_rows_for_batch, 200):
+                client.batch_create_records(base_token, member_table_id, member_fields, batch)
+            for batch in chunked(message_rows_for_batch, 200):
+                client.batch_create_records(base_token, message_table_id, message_fields, batch)
         else:
-            print(f"    已写入 {chat_message_count} 条消息。", file=sys.stderr)
+            for payload, chat_record_id in zip(batch_payloads, chat_record_id_list):
+                chat_id = str(payload["chat_id"])
+                chat_name = str(payload["chat_name"])
+                member_rows = list(payload.get("member_rows") or [])
+                for batch in chunked(member_rows, 200):
+                    member_result = client.batch_create_records(base_token, member_table_id, member_fields, batch)
+                    client.batch_update_groupchat_fields_v1(
+                        base_token,
+                        member_table_id,
+                        [str(record_id) for record_id in (member_result.get("record_id_list") or [])],
+                        chat_id,
+                        chat_name,
+                    )
+
+                for batch in chunked(list(payload.get("message_rows") or []), 200):
+                    message_result = client.batch_create_records(base_token, message_table_id, message_fields, batch)
+                    client.batch_update_groupchat_fields_v1(
+                        base_token,
+                        message_table_id,
+                        [str(record_id) for record_id in (message_result.get("record_id_list") or [])],
+                        chat_id,
+                        chat_name,
+                    )
+
+        total_chat_rows += len(batch_payloads)
+        total_members += batch_member_count
+        total_messages += batch_message_count
+        processed_chats += len(chat_batch)
+        skipped_text = f"，跳过 {batch_skipped_count} 条已存在消息" if batch_skipped_count else ""
+        print(
+            f"    批次已写入：群 {len(batch_payloads)} 个，成员 {batch_member_count} 人，消息 {batch_message_count} 条{skipped_text}。",
+            file=sys.stderr,
+        )
 
     result = {
         "base_token": base_token,

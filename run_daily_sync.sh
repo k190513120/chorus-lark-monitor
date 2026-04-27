@@ -12,6 +12,8 @@ python3 sync_feishu_groups_to_base.py \
   --scheduled-daily \
   --refresh-metadata-tables \
   --skip-share-links \
+  --fast-metadata \
+  --skip-groupchat-field-updates \
   --sync-timezone "${SYNC_TIMEZONE:-Asia/Shanghai}" \
   --chat-order created_desc \
   "$@"
