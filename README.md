@@ -206,7 +206,7 @@ export GROUP_JOIN_ADMIN_TOKEN='...'
 
 需要的权限：
 
-- 用户授权：`offline_access`、`auth:user.id:read`、`im:chat`、`im:chat.members:write_only`
+- 用户授权：`offline_access`、`auth:user.id:read`、`im:chat:read`、`im:chat.members:write_only`
 - 机器人/应用：能用 `tenant_access_token` 调用 `im/v1/chats`，也就是当前日同步已经在使用的群列表权限
 
 如果不用 Worker，也可以用本地 JSON token 池：
