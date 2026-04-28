@@ -2,8 +2,8 @@ name: Ensure Bot in External Groups
 
 on:
   schedule:
-    # 北京时间 09:00 = UTC 01:00，先拉 bot 入群，再等 10:00 的 Base 同步读取新群
-    - cron: '0 1 * * *'
+    # 北京时间 22:00 = UTC 14:00
+    - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
       dry_run:

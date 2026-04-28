@@ -216,7 +216,7 @@ export GROUP_JOIN_USER_TOKEN_POOL='/path/to/.feishu_group_join_user_tokens.json'
 ./run_external_group_join.sh --apply
 ```
 
-仓库已新增 `.github/workflows/external-group-join.yml`，每天北京时间 09:00 先跑一次拉群，10:00 的 Base 同步会读取机器人新加入的群。启用前需要在 GitHub Actions secrets 里增加：
+仓库已新增 `.github/workflows/external-group-join.yml`，每天北京时间 22:00 定时拉机器人进已授权用户加入的外部群。启用前需要在 GitHub Actions secrets 里增加：
 
 - `LARK_APP_ID`
 - `LARK_APP_SECRET`
