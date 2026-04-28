@@ -66,4 +66,4 @@ jobs:
             ARGS="$ARGS --limit-chats $LIMIT_CHATS"
           fi
 
-          ./run_external_group_join.sh $ARGS
+          ./run_external_group_join.sh $ARGS --allow-chat-failures

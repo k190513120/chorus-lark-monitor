@@ -202,6 +202,8 @@ export GROUP_JOIN_ADMIN_TOKEN='...'
 ./run_external_group_join.sh --apply         # 真正拉机器人入群
 ```
 
+部分外部群可能限制只有群主/管理员才能拉人；脚本会继续处理其它群并汇总失败数。GitHub 定时任务默认允许这类单群失败，不会因此整体失败。
+
 授权池优先推荐用 `wechat_bot` 里的 Cloudflare Worker：让用户访问 `/group-join/auth?include_chat_scope=1` 完成授权。这里必须包含列群权限，否则只能拉单个群，不能枚举用户所在外部群。
 
 需要的权限：

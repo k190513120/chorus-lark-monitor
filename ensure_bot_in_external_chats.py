@@ -677,6 +677,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true", help="actually invite the bot (default: dry-run)")
     parser.add_argument("--sleep-seconds", type=float, default=float(os.getenv("EXTERNAL_GROUP_JOIN_SLEEP_SECONDS", "0.2")))
     parser.add_argument("--fail-fast", action="store_true", help="stop on the first user/chat error")
+    parser.add_argument(
+        "--allow-chat-failures",
+        action="store_true",
+        default=bool_env("EXTERNAL_GROUP_JOIN_ALLOW_CHAT_FAILURES"),
+        help="exit 0 even if some chat invites fail; still report failed count",
+    )
     parser.add_argument("--list-authorized-users", action="store_true", help="list authorized users without printing tokens")
     parser.add_argument("--check-bot-access", action="store_true", help="only verify that app credentials can list bot chats")
     parser.add_argument("--verbose", action="store_true")
@@ -774,7 +780,11 @@ def main() -> int:
             fail_fast=args.fail_fast,
         )
         print(f"\nDone. added_or_present={ok_count} failed={fail_count}")
-        return 0 if fail_count == 0 and not (errors and stats["user_chats"] == 0) else 1
+        if errors and stats["user_chats"] == 0:
+            return 1
+        if fail_count and not args.allow_chat_failures:
+            return 1
+        return 0
     except Exception as exc:  # noqa: BLE001
         print(f"ERROR: {short_error(exc)}", file=sys.stderr)
         return 1
