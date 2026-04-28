@@ -18,6 +18,10 @@ on:
         description: '只读测试抽样读取多少个群'
         required: false
         default: '5'
+      skip_sync:
+        description: '跳过写入 Base，只重新导出前端数据并提交/部署'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
@@ -37,6 +41,7 @@ jobs:
           python-version: '3.11'
 
       - name: Run daily sync
+        if: ${{ github.event.inputs.skip_sync != 'true' }}
         env:
           LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
           LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
