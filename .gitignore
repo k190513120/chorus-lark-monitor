@@ -5,3 +5,6 @@ logs/
 .env
 .venv/
 .DS_Store
+.feishu_group_join_user_tokens.json
+.feishu_group_join_token.json
+.external_group_join_state.json

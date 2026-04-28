@@ -186,6 +186,46 @@ python3 export_to_web.py
 
 注意：GitHub Actions 的 cron 偶尔会延迟几分钟，并非严格 10:00。
 
+## 外部群自动拉机器人
+
+脚本文件：`ensure_bot_in_external_chats.py`
+
+它会先用机器人身份列出当前 bot 已在的群，再逐个读取已授权用户的 `user_access_token`，列出这些用户所在的外部群，按 `chat_id` 做差集后把当前应用机器人拉进缺失的外部群。默认是 dry-run，不会改群。
+
+```bash
+export LARK_APP_ID='...'
+export LARK_APP_SECRET='...'
+export GROUP_JOIN_PROXY_URL='https://feishu-bot.xiaomiao.win'
+export GROUP_JOIN_ADMIN_TOKEN='...'
+
+./run_external_group_join.sh                 # dry-run
+./run_external_group_join.sh --apply         # 真正拉机器人入群
+```
+
+授权池优先推荐用 `wechat_bot` 里的 Cloudflare Worker：让用户访问 `/group-join/auth?include_chat_scope=1` 完成授权。这里必须包含列群权限，否则只能拉单个群，不能枚举用户所在外部群。
+
+需要的权限：
+
+- 用户授权：`offline_access`、`auth:user.id:read`、`im:chat`、`im:chat.members:write_only`
+- 机器人/应用：能用 `tenant_access_token` 调用 `im/v1/chats`，也就是当前日同步已经在使用的群列表权限
+
+如果不用 Worker，也可以用本地 JSON token 池：
+
+```bash
+export GROUP_JOIN_USER_TOKEN_POOL='/path/to/.feishu_group_join_user_tokens.json'
+./run_external_group_join.sh --apply
+```
+
+仓库已新增 `.github/workflows/external-group-join.yml`，每天北京时间 09:00 先跑一次拉群，10:00 的 Base 同步会读取机器人新加入的群。启用前需要在 GitHub Actions secrets 里增加：
+
+- `LARK_APP_ID`
+- `LARK_APP_SECRET`
+- `GROUP_JOIN_ADMIN_TOKEN`
+
+可选变量：
+
+- `GROUP_JOIN_PROXY_URL`：不配置时默认 `https://feishu-bot.xiaomiao.win`
+
 ### 本地 cron 备选
 
 ```bash

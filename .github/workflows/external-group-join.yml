@@ -1,0 +1,69 @@
+name: Ensure Bot in External Groups
+
+on:
+  schedule:
+    # 北京时间 09:00 = UTC 01:00，先拉 bot 入群，再等 10:00 的 Base 同步读取新群
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只预览，不真正拉机器人入群'
+        required: false
+        default: 'true'
+      limit_users:
+        description: '最多处理多少个授权用户（空 = 不限制）'
+        required: false
+        default: ''
+      limit_chats:
+        description: '最多处理多少个待入群群聊（空 = 不限制）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: external-group-join
+  cancel-in-progress: false
+
+jobs:
+  ensure:
+    runs-on: ubuntu-latest
+    env:
+      LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
+      LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
+      GROUP_JOIN_PROXY_URL: ${{ vars.GROUP_JOIN_PROXY_URL || 'https://feishu-bot.xiaomiao.win' }}
+      GROUP_JOIN_ADMIN_TOKEN: ${{ secrets.GROUP_JOIN_ADMIN_TOKEN }}
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      LIMIT_USERS: ${{ github.event.inputs.limit_users || '' }}
+      LIMIT_CHATS: ${{ github.event.inputs.limit_chats || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Ensure bot is in authorized users' external groups
+        run: |
+          if [ -z "$LARK_APP_ID" ] || [ -z "$LARK_APP_SECRET" ]; then
+            echo "LARK_APP_ID/LARK_APP_SECRET are not configured; skipping external group join."
+            exit 0
+          fi
+          if [ -z "$GROUP_JOIN_ADMIN_TOKEN" ]; then
+            echo "GROUP_JOIN_ADMIN_TOKEN is not configured; skipping external group join."
+            exit 0
+          fi
+
+          ARGS=""
+          if [ "$DRY_RUN" != "true" ]; then
+            ARGS="$ARGS --apply"
+          fi
+          if [ -n "$LIMIT_USERS" ]; then
+            ARGS="$ARGS --limit-users $LIMIT_USERS"
+          fi
+          if [ -n "$LIMIT_CHATS" ]; then
+            ARGS="$ARGS --limit-chats $LIMIT_CHATS"
+          fi
+
+          ./run_external_group_join.sh $ARGS
