@@ -518,6 +518,27 @@ def print_users(users: List[AuthorizedUser]) -> None:
         print(f"{user.id:<34} {label:<24} {refresh:<8} {expires:<19} {user.scope}")
 
 
+def user_can_list_chats(user: AuthorizedUser) -> bool:
+    if not user.scope:
+        return True
+    scopes = set(user.scope.split())
+    return bool(scopes & {"im:chat", "im:chat:read", "im:chat.group_info:readonly"})
+
+
+def user_token_is_usable(user: AuthorizedUser) -> bool:
+    if not user.expires_at:
+        return True
+    return user.expires_at > time.time() or user.has_refresh_token
+
+
+def user_priority(user: AuthorizedUser) -> Tuple[int, int, str]:
+    return (
+        0 if user_can_list_chats(user) else 1,
+        0 if user_token_is_usable(user) else 1,
+        user.name or user.label or user.id,
+    )
+
+
 def collect_targets(
     client: FeishuClient,
     token_source: object,
@@ -542,11 +563,21 @@ def collect_targets(
         "deduped": 0,
         "targets": 0,
         "user_errors": 0,
+        "skipped_missing_scope": 0,
+        "skipped_expired": 0,
     }
     errors: List[str] = []
 
     for idx, user in enumerate(users, start=1):
         print(f"[{idx}/{len(users)}] Listing chats for {user.display}...")
+        if not user_can_list_chats(user):
+            stats["skipped_missing_scope"] += 1
+            print("  skipped: authorized token does not include im:chat/im:chat:read")
+            continue
+        if not user_token_is_usable(user):
+            stats["skipped_expired"] += 1
+            print("  skipped: token expired and no refresh_token is available")
+            continue
         try:
             access_token = token_source.get_access_token(user.id)  # type: ignore[attr-defined]
             chats = client.list_chats(access_token)
@@ -682,6 +713,7 @@ def main() -> int:
                 for user in users
                 if user.id in wanted or (user.open_id in wanted and user.open_id not in exact_ids)
             ]
+        users.sort(key=user_priority)
         users = limited(users, args.limit_users)
 
         if args.list_authorized_users:
@@ -705,7 +737,8 @@ def main() -> int:
         print(
             "  users={users} user_errors={user_errors} user_chats={user_chats} "
             "candidate_chats={candidate_chats} already_has_bot={already_has_bot} "
-            "deduped={deduped} targets={targets}".format(**stats)
+            "deduped={deduped} skipped_missing_scope={skipped_missing_scope} "
+            "skipped_expired={skipped_expired} targets={targets}".format(**stats)
         )
         if errors:
             print("  user error samples:")
