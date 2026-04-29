@@ -1382,14 +1382,13 @@ def main() -> int:
         for payload, chat_record_id in zip(batch_payloads, chat_record_id_list):
             chat_id = str(payload["chat_id"])
             chat_name = str(payload["chat_name"])
-            if not args.skip_groupchat_field_updates:
-                client.batch_update_groupchat_fields_v1(
-                    base_token,
-                    chat_table_id,
-                    [chat_record_id],
-                    chat_id,
-                    chat_name,
-                )
+            client.batch_update_groupchat_fields_v1(
+                base_token,
+                chat_table_id,
+                [chat_record_id],
+                chat_id,
+                chat_name,
+            )
 
             member_rows = build_member_rows(
                 chat_id,
