@@ -1,10 +1,10 @@
 {
-  "last_success_end_time": 1777354469,
-  "last_success_end_iso": "2026-04-28T13:34:29+08:00",
-  "last_sync_run_id": "20260428133429",
+  "last_success_end_time": 1777430091,
+  "last_success_end_iso": "2026-04-29T10:34:51+08:00",
+  "last_sync_run_id": "20260429103451",
   "identity_source": "bot(app_id=cli_a75bb415d8ff9013) via tenant_access_token/internal",
   "base_token": "PnRtbGmTpaVXwDsWBWPcPaEpnwh",
-  "chat_scope": "all",
+  "chat_scope": "skip:0:max:1",
   "scheduled_baseline": "today",
   "sync_timezone": "Asia/Shanghai"
 }
