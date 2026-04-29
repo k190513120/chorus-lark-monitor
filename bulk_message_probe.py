@@ -436,6 +436,222 @@ def write_rows_to_base(client: FeishuClient, base_token: str, rows: List[Dict[st
     return {"created": created_n, "updated": len(update_record_ids)}
 
 
+def compute_message_stats(
+    client: FeishuClient,
+    chat_id: str,
+    chat_name: str,
+    msg_id: str,
+    sent_at: int,
+    *,
+    sent_at_text: str = "",
+) -> Dict[str, object]:
+    """Pull read/reply/member stats for one (chat, message) pair and return a normalized row."""
+    try:
+        readers = list_read_users(client, msg_id)
+        read_err = ""
+    except FeishuAPIError as exc:
+        readers = []
+        read_err = str(exc)
+
+    try:
+        replies = list_replies(client, chat_id, msg_id, sent_at)
+        reply_err = ""
+    except FeishuAPIError as exc:
+        replies = []
+        reply_err = str(exc)
+
+    try:
+        members = list_all_chat_members(client, chat_id)
+        member_err = ""
+    except FeishuAPIError as exc:
+        members = []
+        member_err = str(exc)
+
+    member_total_all = len(members)
+    target_audience = [m for m in members if not is_excluded_tenant(m.get("tenant_key"))]
+    target_count = len(target_audience)
+    external_readers = [r for r in readers if not is_excluded_tenant(r.get("tenant_key"))]
+    external_reply_senders = {
+        stringify((m.get("sender") or {}).get("id"))
+        for m in replies
+        if not is_excluded_tenant((m.get("sender") or {}).get("tenant_key"))
+    }
+    external_reply_senders.discard("")
+    external_replies = [
+        m for m in replies if not is_excluded_tenant((m.get("sender") or {}).get("tenant_key"))
+    ]
+
+    denominator = max(target_count, 1)
+    read_count = len(external_readers)
+    read_rate = read_count / denominator if target_count else 0.0
+    reply_count = len(external_replies)
+    reply_unique = len(external_reply_senders)
+    reply_rate = reply_unique / denominator if target_count else 0.0
+
+    return {
+        "chat_id": chat_id,
+        "chat_name": chat_name,
+        "message_id": msg_id,
+        "send_ok": True,
+        "send_error": "",
+        "sent_at_text": sent_at_text or epoch_seconds_to_text(sent_at, SYNC_TZ),
+        "member_total_all": member_total_all,
+        "target_audience": target_count,
+        "excluded_tenant_keys": sorted(EXCLUDED_TENANT_KEYS),
+        "read_count": read_count,
+        "read_rate": round(read_rate, 4),
+        "reply_count": reply_count,
+        "reply_unique_senders": reply_unique,
+        "reply_rate": round(reply_rate, 4),
+        "errors": {k: v for k, v in {"read": read_err, "reply": reply_err, "member": member_err}.items() if v},
+        "reply_samples": [
+            {
+                "sender": (m.get("sender") or {}).get("id"),
+                "tenant_key": (m.get("sender") or {}).get("tenant_key"),
+                "create_time": m.get("create_time"),
+                "text": extract_message_text(m)[:120],
+            }
+            for m in external_replies[:5]
+        ],
+    }
+
+
+def list_recent_bulk_tasks(
+    client: FeishuClient,
+    base_token: str,
+    table_id: str,
+    *,
+    max_age_days: int,
+) -> List[Dict[str, str]]:
+    """Yield task rows (record_id, message_id, chat_id, chat_name, sent_at_text, sent_at, batch_id, title)
+    that were sent within max_age_days. Skips rows without 消息ID (failed sends)."""
+    cutoff_ts = int(time.time()) - max_age_days * 86400
+    out: List[Dict[str, str]] = []
+    page_token: Optional[str] = None
+    while True:
+        params: Dict[str, object] = {
+            "page_size": 200,
+            "field_names": json.dumps(
+                ["消息ID", "群ID", "群名称", "发送时间", "群发批次", "任务标题", "消息内容"],
+                ensure_ascii=False,
+            ),
+        }
+        if page_token:
+            params["page_token"] = page_token
+        data = client.request(
+            "GET",
+            f"/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}/records",
+            params=params,
+        )
+        for item in data.get("items") or []:
+            fields = item.get("fields") or {}
+            msg_id = _extract_text(fields.get("消息ID"))
+            if not msg_id:
+                continue
+            sent_at_text = _extract_text(fields.get("发送时间"))
+            sent_at_ts = 0
+            if sent_at_text:
+                try:
+                    sent_at_ts = int(
+                        datetime.strptime(sent_at_text, "%Y-%m-%d %H:%M:%S")
+                        .replace(tzinfo=SYNC_TZ)
+                        .timestamp()
+                    )
+                except ValueError:
+                    sent_at_ts = 0
+            if sent_at_ts and sent_at_ts < cutoff_ts:
+                continue
+            out.append(
+                {
+                    "record_id": str(item.get("record_id") or ""),
+                    "message_id": msg_id,
+                    "chat_id": _extract_text(fields.get("群ID")),
+                    "chat_name": _extract_text(fields.get("群名称")),
+                    "sent_at_text": sent_at_text,
+                    "sent_at_ts": sent_at_ts,
+                    "batch_id": _extract_text(fields.get("群发批次")),
+                    "title": _extract_text(fields.get("任务标题")),
+                    "text": _extract_text(fields.get("消息内容")),
+                }
+            )
+        if not data.get("has_more"):
+            break
+        page_token = data.get("page_token")
+        if not page_token:
+            break
+    return out
+
+
+def cmd_refresh(args: argparse.Namespace) -> int:
+    """无 state file 模式：直接读 Base 任务表，对最近 N 天的任务重新采集统计并 upsert 回去。"""
+    base_url = os.environ.get("LARK_BASE_URL")
+    if not base_url:
+        sys.exit("LARK_BASE_URL is required")
+    base_token = parse_base_token(base_url)
+    client = make_client()
+
+    table_id = ensure_table_and_fields(
+        client,
+        base_token,
+        BULK_TASK_TABLE_NAME,
+        BULK_TASK_FIELD_DEFS,
+        recreate_tables=False,
+    )
+    client.ensure_groupchat_field_v1(base_token, table_id, BULK_TASK_GROUPCHAT_FIELD)
+
+    tasks = list_recent_bulk_tasks(client, base_token, table_id, max_age_days=args.max_age_days)
+    if not tasks:
+        print(f"近 {args.max_age_days} 天内没有可刷新的任务（消息ID 非空且发送时间在窗口内）。")
+        return 0
+
+    print(f"找到 {len(tasks)} 条最近 {args.max_age_days} 天内的任务，开始刷新统计...")
+    collected_at_text = epoch_seconds_to_text(int(time.time()), SYNC_TZ)
+
+    update_record_ids: List[str] = []
+    update_rows: List[List[object]] = []
+    update_chats: List[Dict[str, str]] = []
+
+    for idx, task in enumerate(tasks, 1):
+        row = compute_message_stats(
+            client,
+            task["chat_id"],
+            task["chat_name"],
+            task["message_id"],
+            task["sent_at_ts"],
+            sent_at_text=task["sent_at_text"],
+        )
+        # 把 task 的 batch_id / title / text 注入 state-like 容器，供 build_bulk_task_row 用
+        synth_state = {
+            "batch_id": task["batch_id"],
+            "title": task["title"],
+            "text": task["text"],
+        }
+        bitable_row = build_bulk_task_row(row, synth_state, collected_at_text)
+        update_record_ids.append(task["record_id"])
+        update_rows.append(bitable_row)
+        update_chats.append({"chat_id": task["chat_id"], "chat_name": task["chat_name"]})
+
+        print(
+            f"  [{idx}/{len(tasks)}] {task['chat_name'] or task['chat_id']}  "
+            f"read={row['read_count']}/{row['target_audience']}={row['read_rate']:.1%}  "
+            f"reply={row['reply_count']}"
+        )
+
+    if update_record_ids:
+        for batch_idx, batch_ids in enumerate(chunked(update_record_ids, 200)):
+            batch_rows = update_rows[batch_idx * 200 : batch_idx * 200 + len(batch_ids)]
+            client.batch_update_records_v1(
+                base_token, table_id, BULK_TASK_FIELDS, batch_ids, batch_rows
+            )
+        for rid, meta in zip(update_record_ids, update_chats):
+            if meta["chat_id"]:
+                client.batch_update_groupchat_fields_v1(
+                    base_token, table_id, [rid], meta["chat_id"], meta["chat_name"]
+                )
+    print(f"\n完成：更新 {len(update_record_ids)} 条任务统计。")
+    return 0
+
+
 def cmd_collect(args: argparse.Namespace) -> int:
     if not os.path.exists(args.state_file):
         sys.exit(f"state file not found: {args.state_file}")
@@ -474,85 +690,22 @@ def cmd_collect(args: argparse.Namespace) -> int:
             continue
         msg_id = str(r["message_id"])
         sent_at = int(r.get("sent_at") or 0)
-
-        try:
-            readers = list_read_users(client, msg_id)
-        except FeishuAPIError as exc:
-            readers = []
-            read_err = str(exc)
-        else:
-            read_err = ""
-
-        try:
-            replies = list_replies(client, chat_id, msg_id, sent_at)
-        except FeishuAPIError as exc:
-            replies = []
-            reply_err = str(exc)
-        else:
-            reply_err = ""
-
-        try:
-            members = list_all_chat_members(client, chat_id)
-            member_err = ""
-        except FeishuAPIError as exc:
-            members = []
-            member_err = str(exc)
-
-        member_total_all = len(members)
-        target_audience = [m for m in members if not is_excluded_tenant(m.get("tenant_key"))]
-        target_count = len(target_audience)
-        external_readers = [r for r in readers if not is_excluded_tenant(r.get("tenant_key"))]
-        external_reply_senders = {
-            stringify((m.get("sender") or {}).get("id"))
-            for m in replies
-            if not is_excluded_tenant((m.get("sender") or {}).get("tenant_key"))
-        }
-        external_reply_senders.discard("")
-        external_replies = [
-            m for m in replies if not is_excluded_tenant((m.get("sender") or {}).get("tenant_key"))
-        ]
-
-        denominator = max(target_count, 1)
-        read_count = len(external_readers)
-        read_rate = read_count / denominator if target_count else 0.0
-        reply_count = len(external_replies)
-        reply_unique = len(external_reply_senders)
-        reply_rate = reply_unique / denominator if target_count else 0.0
-
-        row = {
-            "chat_id": chat_id,
-            "chat_name": chat_name,
-            "message_id": msg_id,
-            "send_ok": True,
-            "send_error": "",
-            "sent_at_text": r.get("sent_at_text") or epoch_seconds_to_text(sent_at, SYNC_TZ),
-            "member_total_all": member_total_all,
-            "target_audience": target_count,
-            "excluded_tenant_keys": sorted(EXCLUDED_TENANT_KEYS),
-            "read_count": read_count,
-            "read_rate": round(read_rate, 4),
-            "reply_count": reply_count,
-            "reply_unique_senders": reply_unique,
-            "reply_rate": round(reply_rate, 4),
-            "errors": {k: v for k, v in {"read": read_err, "reply": reply_err, "member": member_err}.items() if v},
-            "reply_samples": [
-                {
-                    "sender": (m.get("sender") or {}).get("id"),
-                    "tenant_key": (m.get("sender") or {}).get("tenant_key"),
-                    "create_time": m.get("create_time"),
-                    "text": extract_message_text(m)[:120],
-                }
-                for m in external_replies[:5]
-            ],
-        }
+        row = compute_message_stats(
+            client,
+            chat_id,
+            chat_name,
+            msg_id,
+            sent_at,
+            sent_at_text=r.get("sent_at_text") or "",
+        )
         rows.append(row)
 
         print(f"\n--- {chat_name or chat_id} ({chat_id})")
         print(f"  msg_id           : {msg_id}")
-        print(f"  群人数            : {member_total_all}（排除 {member_total_all - target_count} 个内部 tenant）")
-        print(f"  目标受众          : {target_count}")
-        print(f"  read   {read_count}  rate={read_rate:.1%}")
-        print(f"  reply  {reply_count} 条 / {reply_unique} 人  rate={reply_rate:.1%}")
+        print(f"  群人数            : {row['member_total_all']}（排除 {row['member_total_all'] - row['target_audience']} 个内部 tenant）")
+        print(f"  目标受众          : {row['target_audience']}")
+        print(f"  read   {row['read_count']}  rate={row['read_rate']:.1%}")
+        print(f"  reply  {row['reply_count']} 条 / {row['reply_unique_senders']} 人  rate={row['reply_rate']:.1%}")
         if row["errors"]:
             print(f"  errors: {row['errors']}")
         if row["reply_samples"]:
@@ -611,6 +764,18 @@ def main() -> int:
         help=f"upsert 到 Base「{BULK_TASK_TABLE_NAME}」表（按 消息ID 主键）。需要 LARK_BASE_URL 环境变量。",
     )
     p_collect.set_defaults(func=cmd_collect)
+
+    p_refresh = sub.add_parser(
+        "refresh",
+        help=f"从 Base「{BULK_TASK_TABLE_NAME}」表读最近 N 天的任务，重新统计并写回（无需 state file，给 CI 用）。",
+    )
+    p_refresh.add_argument(
+        "--max-age-days",
+        type=int,
+        default=7,
+        help="只刷新发送时间在这么多天内的任务（默认 7）",
+    )
+    p_refresh.set_defaults(func=cmd_refresh)
 
     args = parser.parse_args()
     return args.func(args)

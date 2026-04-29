@@ -1,0 +1,43 @@
+name: Refresh Bulk Message Stats
+
+on:
+  schedule:
+    # 北京时间 20:00 = UTC 12:00（一天一次，业务结束时刷新近 7 天群发的已读/回复统计）
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      max_age_days:
+        description: '只刷新发送时间在这么多天内的任务（默认 7）'
+        required: false
+        default: '7'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refresh-bulk-stats
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    env:
+      LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
+      LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
+      LARK_BASE_URL: ${{ secrets.LARK_BASE_URL }}
+      EXCLUDE_TENANT_KEYS: ${{ vars.EXCLUDE_TENANT_KEYS || '736588c9260f175d' }}
+      MAX_AGE_DAYS: ${{ github.event.inputs.max_age_days || '7' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Refresh bulk-message stats
+        run: |
+          if [ -z "$LARK_APP_ID" ] || [ -z "$LARK_APP_SECRET" ] || [ -z "$LARK_BASE_URL" ]; then
+            echo "LARK_APP_ID / LARK_APP_SECRET / LARK_BASE_URL not configured; skipping."
+            exit 0
+          fi
+          python3 bulk_message_probe.py refresh --max-age-days "$MAX_AGE_DAYS"

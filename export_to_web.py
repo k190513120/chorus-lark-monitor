@@ -26,6 +26,9 @@ CLIENT_SIDE_HUE_START = 15
 DEFAULT_MAX_GROUPS = 0
 DEFAULT_MAX_MESSAGES_PER_GROUP = 0
 
+BULK_TASK_TABLE_NAME = "群发任务记录"
+BROADCASTS_DASHBOARD_LIMIT = 10  # 看板上最多显示几条最近群发任务
+
 
 def extract_text(cell) -> str:
     if cell in (None, ""):
@@ -70,6 +73,143 @@ def list_all_records(client: FeishuClient, app_token: str, table_id: str, field_
         page_token = data.get("page_token")
         if not page_token:
             return records
+
+
+def find_table_id_optional(client: FeishuClient, base_token: str, name: str) -> Optional[str]:
+    """Like find_table_id but returns None if the table is missing instead of raising."""
+    for item in client.list_tables(base_token):
+        if item.get("name") == name or item.get("table_name") == name:
+            for key in ("table_id", "id"):
+                if item.get(key):
+                    return str(item[key])
+    return None
+
+
+def parse_pct_string(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        return float(value.rstrip("%").strip()) / 100.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_int(value: object, default: int = 0) -> int:
+    text = extract_text(value).strip() if not isinstance(value, str) else value.strip()
+    if not text:
+        return default
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return default
+
+
+def load_broadcasts(client: FeishuClient, base_token: str, sync_tz: tzinfo) -> List[Dict]:
+    """Read 群发任务记录 table and aggregate per 群发批次. Returns list sorted by sent time desc."""
+    table_id = find_table_id_optional(client, base_token, BULK_TASK_TABLE_NAME)
+    if not table_id:
+        return []
+    raw = list_all_records(
+        client,
+        base_token,
+        table_id,
+        field_names=[
+            "群发批次",
+            "任务标题",
+            "群ID",
+            "群名称",
+            "消息ID",
+            "消息内容",
+            "发送时间",
+            "发送状态",
+            "群人数",
+            "目标受众",
+            "已读人数",
+            "已读率",
+            "回复条数",
+            "回复人数",
+            "回复率",
+            "最后采集时间",
+        ],
+    )
+
+    by_batch: Dict[str, Dict] = {}
+    for rec in raw:
+        f = rec.get("fields") or {}
+        batch_id = extract_text(f.get("群发批次")) or "(no-batch)"
+        title = extract_text(f.get("任务标题"))
+        text = extract_text(f.get("消息内容"))
+        sent_at_text = extract_text(f.get("发送时间"))
+        collected_at_text = extract_text(f.get("最后采集时间"))
+        send_status = extract_text(f.get("发送状态"))
+        chat_id = extract_text(f.get("群ID"))
+        chat_name = extract_text(f.get("群名称"))
+
+        sent_at_ms = 0
+        if sent_at_text:
+            try:
+                sent_at_ms = int(
+                    datetime.strptime(sent_at_text, "%Y-%m-%d %H:%M:%S")
+                    .replace(tzinfo=sync_tz)
+                    .timestamp()
+                    * 1000
+                )
+            except ValueError:
+                sent_at_ms = 0
+
+        bucket = by_batch.setdefault(
+            batch_id,
+            {
+                "batchId": batch_id,
+                "title": title or "(无标题)",
+                "text": text,
+                "sentAtText": sent_at_text,
+                "sentAtMs": sent_at_ms,
+                "collectedAtText": collected_at_text,
+                "chatCount": 0,
+                "successCount": 0,
+                "failureCount": 0,
+                "targetAudience": 0,
+                "readCount": 0,
+                "replyCount": 0,
+                "replyUniqueSenders": 0,
+                "chats": [],
+            },
+        )
+        # 同一 batch 多行时保留最早发送时间（首次发送时刻）
+        if sent_at_ms and (bucket["sentAtMs"] == 0 or sent_at_ms < bucket["sentAtMs"]):
+            bucket["sentAtMs"] = sent_at_ms
+            bucket["sentAtText"] = sent_at_text
+        if title and not bucket["title"].strip():
+            bucket["title"] = title
+        if collected_at_text and collected_at_text > bucket["collectedAtText"]:
+            bucket["collectedAtText"] = collected_at_text
+
+        bucket["chatCount"] += 1
+        if send_status == "成功":
+            bucket["successCount"] += 1
+        else:
+            bucket["failureCount"] += 1
+        bucket["targetAudience"] += parse_int(f.get("目标受众"))
+        bucket["readCount"] += parse_int(f.get("已读人数"))
+        bucket["replyCount"] += parse_int(f.get("回复条数"))
+        bucket["replyUniqueSenders"] += parse_int(f.get("回复人数"))
+        bucket["chats"].append(
+            {
+                "chatId": chat_id,
+                "chatName": chat_name,
+                "readRate": parse_pct_string(extract_text(f.get("已读率"))),
+                "replyRate": parse_pct_string(extract_text(f.get("回复率"))),
+            }
+        )
+
+    items = list(by_batch.values())
+    for it in items:
+        it["avgReadRate"] = round(it["readCount"] / it["targetAudience"], 4) if it["targetAudience"] else 0.0
+        it["avgReplyRate"] = round(it["replyUniqueSenders"] / it["targetAudience"], 4) if it["targetAudience"] else 0.0
+
+    items.sort(key=lambda x: x["sentAtMs"] or 0, reverse=True)
+    return items
 
 
 def find_table_id(client: FeishuClient, base_token: str, name: str) -> str:
@@ -246,6 +386,7 @@ def build_app_data(
     messages_by_chat: Dict[str, List[Dict]],
     sync_tz: tzinfo,
     max_messages_per_group: int,
+    broadcasts: Optional[List[Dict]] = None,
 ) -> Dict:
     now_ms = int(datetime.now(sync_tz).timestamp() * 1000)
     today_start_ms = int(datetime.now(sync_tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
@@ -440,6 +581,7 @@ def build_app_data(
         ],
         "TAGS": ["咨询", "购买", "售后", "实施中", "KA客户", "多人群", "活跃"],
         "DASHBOARD": dashboard,
+        "BROADCASTS": (broadcasts or [])[:BROADCASTS_DASHBOARD_LIMIT],
     }
 
 
@@ -558,12 +700,23 @@ def main() -> int:
     messages_by_chat = load_messages(client, base_token, message_table_id, sync_tz)
     print(f"  message rows: {sum(len(v) for v in messages_by_chat.values())} (groups with messages: {len(messages_by_chat)})", file=sys.stderr)
 
+    print("正在拉取群发任务记录...", file=sys.stderr)
+    broadcasts = load_broadcasts(client, base_token, sync_tz)
+    print(f"  broadcast batches: {len(broadcasts)}", file=sys.stderr)
+
     group_scope_text = "全部群" if max_groups <= 0 else f"前 {max_groups} 个群"
     print(f"正在筛选{group_scope_text}（按消息数 → 成员数排序）...", file=sys.stderr)
     selected = pick_active_groups(chats, members_by_chat, messages_by_chat, max_groups)
 
     print("正在构建 AppData...", file=sys.stderr)
-    payload = build_app_data(selected, members_by_chat, messages_by_chat, sync_tz, max_messages_per_group)
+    payload = build_app_data(
+        selected,
+        members_by_chat,
+        messages_by_chat,
+        sync_tz,
+        max_messages_per_group,
+        broadcasts=broadcasts,
+    )
 
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
 

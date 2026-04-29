@@ -231,7 +231,95 @@ const AlertStrip = ({ stalled, onOpen }) => {
   );
 };
 
-const StatsOverview = ({ D, onAlertOpen }) => {
+const BroadcastsCard = ({ items }) => {
+  if (!items || items.length === 0) {
+    return (
+      <Card style={{ padding: 18 }}>
+        <div style={{ fontSize: 13, color: "var(--ink-3)", marginBottom: 8 }}>近期群发</div>
+        <div style={{ fontSize: 12, color: "var(--ink-3)" }}>暂无群发记录</div>
+      </Card>
+    );
+  }
+
+  const formatPct = (v) => `${(v * 100).toFixed(1)}%`;
+  const heatColor = (rate) => {
+    if (rate >= 0.6) return "oklch(0.60 0.12 155)";   // sage
+    if (rate >= 0.3) return "oklch(0.62 0.13 75)";    // amber
+    return "oklch(0.62 0.13 20)";                     // rose
+  };
+
+  return (
+    <Card style={{ padding: 18 }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 14 }}>
+        <div>
+          <div style={{ fontSize: 13, color: "var(--ink-3)", marginBottom: 2 }}>近期群发</div>
+          <div style={{ fontSize: 18, fontWeight: 600 }} className="num">
+            {items.length} <span style={{ fontSize: 12, color: "var(--ink-3)", fontWeight: 400 }}>批</span>
+          </div>
+        </div>
+        <div style={{ fontSize: 11.5, color: "var(--ink-3)" }}>
+          已读率 / 回复率均已排除内部 tenant
+        </div>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{
+          display: "grid",
+          gridTemplateColumns: "1.6fr 90px 90px 110px 130px",
+          gap: 8,
+          padding: "6px 10px",
+          fontSize: 11.5,
+          color: "var(--ink-3)",
+          background: "var(--bg-sunk)",
+          borderRadius: 8,
+        }}>
+          <div>任务标题</div>
+          <div style={{ textAlign: "right" }}>群数</div>
+          <div style={{ textAlign: "right" }}>受众</div>
+          <div style={{ textAlign: "right" }}>已读率</div>
+          <div style={{ textAlign: "right" }}>回复率</div>
+        </div>
+        {items.map((b) => (
+          <div key={b.batchId} style={{
+            display: "grid",
+            gridTemplateColumns: "1.6fr 90px 90px 110px 130px",
+            gap: 8,
+            padding: "8px 10px",
+            fontSize: 12.5,
+            alignItems: "center",
+            borderBottom: "1px solid var(--line)",
+          }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{
+                fontWeight: 500,
+                whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+              }} title={b.text}>
+                {b.title}
+              </div>
+              <div style={{ fontSize: 11, color: "var(--ink-3)", marginTop: 2 }}>
+                {b.sentAtText || "—"}
+              </div>
+            </div>
+            <div style={{ textAlign: "right", color: b.failureCount ? "oklch(0.55 0.12 20)" : "var(--ink)" }} className="num">
+              {b.successCount}{b.failureCount ? ` / -${b.failureCount}` : ""}
+            </div>
+            <div style={{ textAlign: "right" }} className="num">{b.targetAudience}</div>
+            <div style={{ textAlign: "right", color: heatColor(b.avgReadRate), fontWeight: 500 }} className="num">
+              {formatPct(b.avgReadRate)}
+              <span style={{ color: "var(--ink-3)", fontWeight: 400, fontSize: 11 }}> ({b.readCount})</span>
+            </div>
+            <div style={{ textAlign: "right", color: heatColor(b.avgReplyRate), fontWeight: 500 }} className="num">
+              {formatPct(b.avgReplyRate)}
+              <span style={{ color: "var(--ink-3)", fontWeight: 400, fontSize: 11 }}> ({b.replyUniqueSenders}人/{b.replyCount}条)</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+};
+
+const StatsOverview = ({ D, broadcasts, onAlertOpen }) => {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       <AlertStrip stalled={D.stalled} onOpen={onAlertOpen} />
@@ -272,6 +360,8 @@ const StatsOverview = ({ D, onAlertOpen }) => {
         <SentimentDonut items={D.sentimentBreakdown} />
         <SpeakerBars speakers={D.speakerDist} />
       </div>
+
+      <BroadcastsCard items={broadcasts} />
     </div>
   );
 };

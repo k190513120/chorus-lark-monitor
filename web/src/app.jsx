@@ -41,7 +41,7 @@ function App() {
         />
         <div className="scroll" style={{ flex: 1, overflowY: "auto", background: "var(--bg-sunk)" }}>
           <div style={{ padding: "18px 22px 0" }}>
-            <StatsOverview D={AppData.DASHBOARD} onAlertOpen={g => setActiveId(g.id)} />
+            <StatsOverview D={AppData.DASHBOARD} broadcasts={AppData.BROADCASTS} onAlertOpen={g => setActiveId(g.id)} />
           </div>
           <div style={{ padding: "18px 22px 22px" }}>
             <Card padded={false} style={{ overflow: "hidden", height: "calc(100vh - 470px)", minHeight: 560, display: "flex", flexDirection: "column" }}>
