@@ -8,3 +8,5 @@ logs/
 .feishu_group_join_user_tokens.json
 .feishu_group_join_token.json
 .external_group_join_state.json
+.bulk_message_probe_state.json
+.wrangler/
