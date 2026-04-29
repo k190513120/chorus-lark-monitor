@@ -5,10 +5,12 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
@@ -128,6 +130,7 @@ class FeishuClient:
         self.tenant_access_token: Optional[str] = None
         self.token_acquired_at: float = 0.0
         self.v1_field_cache: Dict[str, List[Dict[str, object]]] = {}
+        self._token_lock = threading.Lock()
 
     def authenticate(self) -> None:
         data = self.request(
@@ -154,7 +157,12 @@ class FeishuClient:
     def _maybe_refresh_token(self) -> None:
         if not self.tenant_access_token:
             return
-        if time.time() - self.token_acquired_at >= TOKEN_REFRESH_INTERVAL_SECONDS:
+        if time.time() - self.token_acquired_at < TOKEN_REFRESH_INTERVAL_SECONDS:
+            return
+        with self._token_lock:
+            # double-check after acquiring lock — another thread may have refreshed
+            if time.time() - self.token_acquired_at < TOKEN_REFRESH_INTERVAL_SECONDS:
+                return
             self.authenticate()
 
     def request(
@@ -699,6 +707,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=200,
         help="Number of chats to read before batch-writing records. Max write batch remains 200.",
+    )
+    parser.add_argument(
+        "--read-concurrency",
+        type=int,
+        default=1,
+        help="Number of chats to read in parallel within each batch (default 1 = serial). 8-16 is a good value.",
     )
     parser.add_argument(
         "--smoke-test",
@@ -1395,58 +1409,63 @@ def main() -> int:
     total_chat_rows = 0
     processed_chats = 0
     batch_size = max(1, min(args.sync_batch_size, 200))
+    read_concurrency = max(1, args.read_concurrency)
+
+    def read_one_chat(chat: Dict[str, object]) -> Dict[str, object]:
+        chat_id = stringify(chat.get("chat_id"))
+        detail = dict(chat) if args.fast_metadata else client.get_chat_detail(chat_id)
+        members_payload = client.list_chat_members(chat_id)
+        members = list(members_payload.get("items") or [])
+        member_total = int(members_payload.get("member_total") or len(members))
+        if args.skip_share_links:
+            share_link: Dict[str, object] = {}
+        else:
+            try:
+                share_link = client.get_chat_share_link(chat_id)
+            except Exception as exc:  # noqa: BLE001
+                share_link = {"_error": str(exc)}
+        chat_name = stringify(detail.get("name") or chat.get("name"))
+        chat_row = build_chat_row(
+            chat,
+            detail,
+            share_link,
+            members,
+            member_total,
+            sync_run_id,
+            sync_time_text,
+            sync_tz,
+        )
+        messages = list(
+            client.iter_messages(
+                chat_id,
+                page_size=args.message_page_size,
+                start_time=start_time,
+                end_time=end_time,
+                max_messages=args.max_messages_per_chat,
+            )
+        )
+        return {
+            "chat_id": chat_id,
+            "chat_name": chat_name,
+            "chat_row": chat_row,
+            "members": members,
+            "messages": messages,
+        }
+
     for chat_batch in chunked(chats, batch_size):
-        batch_payloads: List[Dict[str, object]] = []
         batch_start = processed_chats + 1
         batch_end = processed_chats + len(chat_batch)
+        concurrency_text = f"（并发 {read_concurrency}）" if read_concurrency > 1 else ""
         print(
-            f"[{batch_start}-{batch_end}/{len(chats)}] 正在读取群、成员和消息...",
+            f"[{batch_start}-{batch_end}/{len(chats)}] 正在读取群、成员和消息{concurrency_text}...",
             file=sys.stderr,
         )
 
-        for chat in chat_batch:
-            chat_id = stringify(chat.get("chat_id"))
-            detail = dict(chat) if args.fast_metadata else client.get_chat_detail(chat_id)
-            members_payload = client.list_chat_members(chat_id)
-            members = list(members_payload.get("items") or [])
-            member_total = int(members_payload.get("member_total") or len(members))
-            if args.skip_share_links:
-                share_link = {}
-            else:
-                try:
-                    share_link = client.get_chat_share_link(chat_id)
-                except Exception as exc:  # noqa: BLE001
-                    share_link = {"_error": str(exc)}
-
-            chat_name = stringify(detail.get("name") or chat.get("name"))
-            chat_row = build_chat_row(
-                chat,
-                detail,
-                share_link,
-                members,
-                member_total,
-                sync_run_id,
-                sync_time_text,
-                sync_tz,
-            )
-            messages = list(
-                client.iter_messages(
-                    chat_id,
-                    page_size=args.message_page_size,
-                    start_time=start_time,
-                    end_time=end_time,
-                    max_messages=args.max_messages_per_chat,
-                )
-            )
-            batch_payloads.append(
-                {
-                    "chat_id": chat_id,
-                    "chat_name": chat_name,
-                    "chat_row": chat_row,
-                    "members": members,
-                    "messages": messages,
-                }
-            )
+        if read_concurrency > 1 and len(chat_batch) > 1:
+            with ThreadPoolExecutor(max_workers=min(read_concurrency, len(chat_batch))) as executor:
+                batch_payloads: List[Dict[str, object]] = list(executor.map(read_one_chat, chat_batch))
+        else:
+            batch_payloads = [read_one_chat(chat) for chat in chat_batch]
 
         update_record_ids: List[str] = []
         update_rows: List[List[object]] = []
