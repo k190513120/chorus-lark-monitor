@@ -406,7 +406,7 @@ class FeishuClient:
         for field in self.list_fields_v1(app_token, table_id):
             if stringify(field.get("field_name")) == field_name:
                 return
-        self.request(
+        response = self.request(
             "POST",
             f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
             data={
@@ -417,7 +417,16 @@ class FeishuClient:
                 "ui_type": "GroupChat",
             },
         )
-        self.v1_field_cache.pop(f"{app_token}:{table_id}", None)
+        cache_key = f"{app_token}:{table_id}"
+        self.v1_field_cache.pop(cache_key, None)
+        created = response.get("field") if isinstance(response, dict) else None
+        if isinstance(created, dict) and created.get("field_name"):
+            self.v1_field_cache[cache_key] = list(self.list_fields_v1(app_token, table_id))
+            if not any(
+                stringify(field.get("field_name")) == field_name
+                for field in self.v1_field_cache[cache_key]
+            ):
+                self.v1_field_cache[cache_key].append(created)
 
     def batch_update_groupchat_fields_v1(
         self,
