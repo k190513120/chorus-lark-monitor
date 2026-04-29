@@ -93,6 +93,8 @@ BASE_MESSAGE_FIELD_DEFS = [
 
 CHAT_FIELDS = [field["name"] for field in CHAT_FIELD_DEFS]
 
+CHAT_GROUPCHAT_FIELD_NAME = "群组字段-允许添加多个群组"
+
 
 class FeishuAPIError(RuntimeError):
     pass
@@ -392,6 +394,30 @@ class FeishuClient:
             for field in fields
             if int(field.get("type") or 0) == 23 or stringify(field.get("ui_type")) == "GroupChat"
         ]
+
+    def ensure_groupchat_field_v1(
+        self,
+        app_token: str,
+        table_id: str,
+        field_name: str,
+        *,
+        multiple: bool = True,
+    ) -> None:
+        for field in self.list_fields_v1(app_token, table_id):
+            if stringify(field.get("field_name")) == field_name:
+                return
+        self.request(
+            "POST",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+            data={
+                "field_name": field_name,
+                "is_primary": False,
+                "property": {"multiple": multiple},
+                "type": 23,
+                "ui_type": "GroupChat",
+            },
+        )
+        self.v1_field_cache.pop(f"{app_token}:{table_id}", None)
 
     def batch_update_groupchat_fields_v1(
         self,
@@ -1243,6 +1269,7 @@ def main() -> int:
         CHAT_FIELD_DEFS,
         recreate_tables=args.recreate_tables or args.refresh_metadata_tables,
     )
+    client.ensure_groupchat_field_v1(base_token, chat_table_id, CHAT_GROUPCHAT_FIELD_NAME)
     member_field_defs = materialize_field_defs(BASE_MEMBER_FIELD_DEFS, chat_table_id)
     message_field_defs = materialize_field_defs(BASE_MESSAGE_FIELD_DEFS, chat_table_id)
     member_fields = [field["name"] for field in member_field_defs]
