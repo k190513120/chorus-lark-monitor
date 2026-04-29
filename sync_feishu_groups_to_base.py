@@ -550,6 +550,81 @@ class FeishuClient:
             if not page_token:
                 return values
 
+    def list_existing_record_ids_v1(
+        self,
+        app_token: str,
+        table_id: str,
+        key_field: str,
+    ) -> Dict[str, str]:
+        """Returns {key_value: record_id} for the given text key field."""
+        result: Dict[str, str] = {}
+        page_token: Optional[str] = None
+        while True:
+            params: Dict[str, object] = {
+                "page_size": 500,
+                "field_names": json.dumps([key_field], ensure_ascii=False),
+            }
+            if page_token:
+                params["page_token"] = page_token
+            data = self.request(
+                "GET",
+                f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+                params=params,
+            )
+            for item in data.get("items") or []:
+                cell = (item.get("fields") or {}).get(key_field)
+                key_value = _extract_bitable_text(cell)
+                record_id = item.get("record_id")
+                if key_value and record_id:
+                    result[key_value] = str(record_id)
+            if not data.get("has_more"):
+                return result
+            page_token = data.get("page_token")
+            if not page_token:
+                return result
+
+    def batch_update_records_v1(
+        self,
+        app_token: str,
+        table_id: str,
+        field_names: List[str],
+        record_ids: List[str],
+        rows: List[List[object]],
+    ) -> None:
+        if not record_ids:
+            return
+        if len(record_ids) != len(rows):
+            raise FeishuAPIError(
+                f"batch_update_records_v1: record_ids({len(record_ids)}) and rows({len(rows)}) length mismatch"
+            )
+        records = []
+        for record_id, row in zip(record_ids, rows):
+            fields_dict = {
+                name: value
+                for name, value in zip(field_names, row)
+                if value is not None
+            }
+            records.append({"record_id": record_id, "fields": fields_dict})
+        self.request(
+            "POST",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update",
+            data={"records": records},
+        )
+
+    def batch_delete_records_v1(
+        self,
+        app_token: str,
+        table_id: str,
+        record_ids: List[str],
+    ) -> None:
+        if not record_ids:
+            return
+        self.request(
+            "POST",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete",
+            data={"records": list(record_ids)},
+        )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1276,9 +1351,17 @@ def main() -> int:
         base_token,
         args.chat_table_name,
         CHAT_FIELD_DEFS,
-        recreate_tables=args.recreate_tables or args.refresh_metadata_tables,
+        recreate_tables=args.recreate_tables,
     )
     client.ensure_groupchat_field_v1(base_token, chat_table_id, CHAT_GROUPCHAT_FIELD_NAME)
+    existing_chat_record_ids: Dict[str, str] = client.list_existing_record_ids_v1(
+        base_token, chat_table_id, "群ID"
+    )
+    print(
+        f"chat 表已有 {len(existing_chat_record_ids)} 条记录（按 群ID 索引），将增量 upsert。",
+        file=sys.stderr,
+    )
+    touched_chat_ids: set = set()
     member_field_defs = materialize_field_defs(BASE_MEMBER_FIELD_DEFS, chat_table_id)
     message_field_defs = materialize_field_defs(BASE_MESSAGE_FIELD_DEFS, chat_table_id)
     member_fields = [field["name"] for field in member_field_defs]
@@ -1365,13 +1448,40 @@ def main() -> int:
                 }
             )
 
-        chat_rows = [payload["chat_row"] for payload in batch_payloads]
-        chat_result = client.batch_create_records(base_token, chat_table_id, CHAT_FIELDS, chat_rows)
-        chat_record_id_list = [str(record_id) for record_id in (chat_result.get("record_id_list") or [])]
-        if len(chat_record_id_list) != len(batch_payloads):
-            raise FeishuAPIError(
-                f"expected {len(batch_payloads)} chat record ids, got {len(chat_record_id_list)}"
+        update_record_ids: List[str] = []
+        update_rows: List[List[object]] = []
+        create_payloads: List[Dict[str, object]] = []
+        for payload in batch_payloads:
+            chat_id = str(payload["chat_id"])
+            touched_chat_ids.add(chat_id)
+            existing_rid = existing_chat_record_ids.get(chat_id)
+            if existing_rid:
+                update_record_ids.append(existing_rid)
+                update_rows.append(payload["chat_row"])
+            else:
+                create_payloads.append(payload)
+
+        if update_record_ids:
+            client.batch_update_records_v1(
+                base_token, chat_table_id, CHAT_FIELDS, update_record_ids, update_rows
             )
+
+        if create_payloads:
+            create_rows = [payload["chat_row"] for payload in create_payloads]
+            create_result = client.batch_create_records(
+                base_token, chat_table_id, CHAT_FIELDS, create_rows
+            )
+            new_ids = [str(rid) for rid in (create_result.get("record_id_list") or [])]
+            if len(new_ids) != len(create_payloads):
+                raise FeishuAPIError(
+                    f"expected {len(create_payloads)} chat record ids, got {len(new_ids)}"
+                )
+            for payload, rid in zip(create_payloads, new_ids):
+                existing_chat_record_ids[str(payload["chat_id"])] = rid
+
+        chat_record_id_list = [
+            existing_chat_record_ids[str(payload["chat_id"])] for payload in batch_payloads
+        ]
 
         member_rows_for_batch: List[List[object]] = []
         message_rows_for_batch: List[List[object]] = []
@@ -1454,6 +1564,21 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    pruned_chat_count = 0
+    if args.max_chats is None and args.skip_chats == 0 and not args.recreate_tables:
+        stale_chat_ids = [
+            cid for cid in existing_chat_record_ids if cid not in touched_chat_ids
+        ]
+        if stale_chat_ids:
+            stale_record_ids = [existing_chat_record_ids[cid] for cid in stale_chat_ids]
+            print(
+                f"清理 chat 表中机器人已不在的 {len(stale_record_ids)} 个群（按 群ID 比对本次同步范围）...",
+                file=sys.stderr,
+            )
+            for batch in chunked(stale_record_ids, 200):
+                client.batch_delete_records_v1(base_token, chat_table_id, batch)
+            pruned_chat_count = len(stale_record_ids)
+
     result = {
         "base_token": base_token,
         "identity_source": client.identity_summary(),
@@ -1463,6 +1588,7 @@ def main() -> int:
         "sync_run_id": sync_run_id,
         "skip_chats": args.skip_chats,
         "chat_count": total_chat_rows,
+        "pruned_chat_count": pruned_chat_count,
         "member_count": total_members,
         "message_count": total_messages,
         "chat_order": args.chat_order,
