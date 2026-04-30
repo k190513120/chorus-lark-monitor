@@ -57,19 +57,57 @@ const BroadcastModal = ({ open, onClose, groups, onSent, prefillGroup }) => {
     return Object.keys(e).length === 0;
   };
 
-  const handleSend = () => {
+  const handleSend = async () => {
     if (!validate()) return;
     setStep(3);
     setSendingProgress(0);
-    const total = pickedIds.size;
-    let done = 0;
-    const tick = () => {
-      done++;
-      setSendingProgress(done);
-      if (done < total) setTimeout(tick, 80 + Math.random() * 200);
-      else setTimeout(() => setSent(true), 400);
+    setErrors({});
+
+    const targets = pickedGroups
+      .filter(g => g.chat_id)  // synthetic g.id 不能用于发消息
+      .map(g => ({ chat_id: g.chat_id, chat_name: g.name }));
+    if (targets.length === 0) {
+      setErrors({ groups: "选中的群没有 chat_id，无法发送" });
+      return;
+    }
+
+    let batchId;
+    try {
+      const res = await fetch("/api/bulk-send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_targets: targets, text, title: text.slice(0, 30) }),
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        setErrors({ send: `发送启动失败: ${err}` });
+        return;
+      }
+      const data = await res.json();
+      batchId = data.batch_id;
+    } catch (err) {
+      setErrors({ send: `网络错误: ${err.message}` });
+      return;
+    }
+
+    // 订阅 WebSocket 进度推送
+    const wsProto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${wsProto}://${location.host}/ws/bulk-progress/${batchId}`);
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (typeof msg.sent === "number") {
+          setSendingProgress(msg.sent + msg.failed);
+        }
+        if (msg.type === "done" || msg.status === "done") {
+          setSent(true);
+          ws.close();
+        }
+      } catch {
+        // ignore non-JSON pings
+      }
     };
-    setTimeout(tick, 200);
+    ws.onerror = () => setErrors(prev => ({ ...prev, ws: "进度连接断开，结果以 Base 为准" }));
   };
 
   return (

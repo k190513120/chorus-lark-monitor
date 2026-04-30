@@ -187,6 +187,11 @@ async def lifespan(app: FastAPI):
     global SCHEDULER
     SCHEDULER = _start_scheduler()
     log.info("server v%s up; env_ok=%s", VERSION, _check_required_env())
+    # Warm the dashboard cache asynchronously so the first browser visit
+    # doesn't trigger a 503 / blank dashboard.
+    if all(_check_required_env().values()):
+        log.info("[dashboard] kicking off initial cache warm-up...")
+        _ensure_dashboard_rebuild_running()
     try:
         yield
     finally:
@@ -315,36 +320,100 @@ def _build_dashboard_payload() -> dict:
     return payload
 
 
-async def _get_or_build_dashboard_payload(force_refresh: bool = False) -> dict:
-    now = time.time()
-    if not force_refresh and _dashboard_cache["data"] and _dashboard_cache["expires_at"] > now:
-        return _dashboard_cache["data"]
-    log.info("[dashboard] building fresh payload (force=%s)", force_refresh)
+def _rebuild_cache_sync() -> None:
+    """Runs in a worker thread. Builds payload + writes cache. Catches errors so
+    the building flag is always cleared."""
     started = time.time()
-    payload = await asyncio.to_thread(_build_dashboard_payload)
-    _dashboard_cache["data"] = payload
-    _dashboard_cache["expires_at"] = now + DASHBOARD_TTL_SEC
-    log.info(
-        "[dashboard] payload built in %.1fs (chats=%d broadcasts=%d)",
-        time.time() - started,
-        payload.get("_meta", {}).get("chat_count", 0),
-        payload.get("_meta", {}).get("broadcast_count", 0),
-    )
-    return payload
+    try:
+        payload = _build_dashboard_payload()
+        _dashboard_cache["data"] = payload
+        _dashboard_cache["expires_at"] = time.time() + DASHBOARD_TTL_SEC
+        _dashboard_cache["last_build_seconds"] = time.time() - started
+        _dashboard_cache["last_error"] = None
+        log.info(
+            "[dashboard] cache rebuilt in %.1fs (chats=%d broadcasts=%d)",
+            _dashboard_cache["last_build_seconds"],
+            payload.get("_meta", {}).get("chat_count", 0),
+            payload.get("_meta", {}).get("broadcast_count", 0),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("[dashboard] rebuild failed after %.1fs", time.time() - started)
+        _dashboard_cache["last_error"] = str(exc)
+    finally:
+        _dashboard_cache["building"] = False
+
+
+def _ensure_dashboard_rebuild_running() -> bool:
+    """Kick off a rebuild if not already in flight. Returns True if started."""
+    if _dashboard_cache.get("building"):
+        return False
+    _dashboard_cache["building"] = True
+    asyncio.create_task(asyncio.to_thread(_rebuild_cache_sync))
+    return True
 
 
 @app.get("/api/dashboard/data")
 async def get_dashboard_data(force_refresh: bool = False) -> dict:
-    """Returns the AppData payload as JSON. Cached for 60s in memory."""
-    return await _get_or_build_dashboard_payload(force_refresh)
+    """Returns AppData JSON.
+
+    Strategy: serve cache immediately if any data exists (even stale). If
+    cache is stale or missing, kick off background rebuild — never block the
+    request thread, since payload build can take several minutes for 16k chats.
+    """
+    now = time.time()
+    cached = _dashboard_cache.get("data")
+    expires = _dashboard_cache.get("expires_at") or 0
+    is_stale = expires <= now
+
+    if force_refresh or is_stale:
+        _ensure_dashboard_rebuild_running()
+
+    if cached:
+        # Always return cached data (even if stale) so dashboard can render.
+        out = dict(cached)
+        out.setdefault("_meta", {})["served_at"] = int(now)
+        out["_meta"]["is_stale"] = is_stale
+        out["_meta"]["building"] = bool(_dashboard_cache.get("building"))
+        return out
+
+    # Cold start, no cache yet.
+    if _dashboard_cache.get("building"):
+        raise HTTPException(503, "dashboard cache is being built — retry in ~30s")
+    raise HTTPException(503, "dashboard cache not warmed yet — retry in ~30s")
 
 
 @app.get("/src/data.jsx")
-async def serve_dashboard_data_jsx(force_refresh: bool = False) -> Response:
-    """Drop-in replacement for the static web/src/data.jsx. Front-end loads this
-    via <script src="src/data.jsx"> and gets fresh AppData on every page load."""
+async def serve_dashboard_data_jsx() -> Response:
+    """Drop-in replacement for the static web/src/data.jsx."""
     import export_to_web as ex
-    payload = await _get_or_build_dashboard_payload(force_refresh)
+    cached = _dashboard_cache.get("data")
+    if not cached:
+        # First page load before cache warmed: kick off build, return a minimal
+        # AppData with empty arrays so the dashboard at least mounts. The user
+        # will see "building" state and can refresh.
+        _ensure_dashboard_rebuild_running()
+        payload = {
+            "TEAM": [],
+            "GROUPS": [],
+            "SENTIMENTS": [],
+            "TAGS": [],
+            "DASHBOARD": {
+                "totalGroups": 0,
+                "activeGroups": 0,
+                "todayMsgs": 0,
+                "avgResponseMin": 0,
+                "pendingClient": 0,
+                "stalled": [],
+                "sentimentBreakdown": [],
+                "speakerDist": [],
+                "hourlyMsgs": [0] * 24,
+            },
+            "BROADCASTS": [],
+            "_meta": {"building": True, "chat_count": 0, "broadcast_count": 0},
+        }
+    else:
+        payload = cached
+
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
     js = ex.DATA_TEMPLATE.format(
         generated_at=datetime.now(SYNC_TZ).strftime("%Y-%m-%d %H:%M:%S%z"),
@@ -355,6 +424,18 @@ async def serve_dashboard_data_jsx(force_refresh: bool = False) -> Response:
         payload=serialized,
     )
     return Response(content=js, media_type="application/javascript; charset=utf-8")
+
+
+@app.post("/admin/rebuild-dashboard-cache")
+async def admin_rebuild_dashboard() -> dict:
+    """Force a cache rebuild. Returns immediately; background task does the work."""
+    started = _ensure_dashboard_rebuild_running()
+    return {
+        "ok": True,
+        "queued": started,
+        "already_building": not started,
+        "current_meta": (_dashboard_cache.get("data") or {}).get("_meta", {}),
+    }
 
 
 # ─── /api/bulk-send + /ws/bulk-progress ───────────────────────────────────────
