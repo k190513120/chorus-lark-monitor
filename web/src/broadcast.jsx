@@ -11,6 +11,8 @@ const BroadcastModal = ({ open, onClose, groups, onSent, prefillGroup }) => {
   const [sent, setSent] = React.useState(false);
   const [filter, setFilter] = React.useState("all");
   const [errors, setErrors] = React.useState({});
+  const [selectedOwners, setSelectedOwners] = React.useState(new Set());
+  const [perOwnerLimit, setPerOwnerLimit] = React.useState("");  // "" 表示不限
 
   React.useEffect(() => {
     if (open) {
@@ -23,6 +25,8 @@ const BroadcastModal = ({ open, onClose, groups, onSent, prefillGroup }) => {
       setErrors({});
       setQuery("");
       setFilter("all");
+      setSelectedOwners(new Set());
+      setPerOwnerLimit("");
       setPickedIds(new Set(prefillGroup ? [prefillGroup.id] : []));
     }
   }, [open, prefillGroup]);
@@ -37,13 +41,44 @@ const BroadcastModal = ({ open, onClose, groups, onSent, prefillGroup }) => {
     });
   };
 
+  // 群主清单 + 每人群数（用于群主多选 UI）
+  const ownerStats = React.useMemo(() => {
+    const m = new Map();
+    for (const g of groups) {
+      const name = (g.owner && g.owner.name) || "(未知)";
+      m.set(name, (m.get(name) || 0) + 1);
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1]);  // 按群数降序
+  }, [groups]);
+
   const filteredGroups = groups.filter(g => {
     if (query && !g.name.includes(query) && !g.company.includes(query)) return false;
+    if (selectedOwners.size > 0 && !selectedOwners.has((g.owner && g.owner.name) || "(未知)")) return false;
     if (filter === "vip") return g.tags.some(t => ["VIP", "KA客户", "战略客户", "高价值"].includes(t));
     if (filter === "renewal") return g.tags.some(t => t === "续约期");
     if (filter === "alert") return g.unreplyMinutes > 60;
     return true;
   });
+
+  // 应用每群主限额：每个 owner 只取前 N 个（按 filteredGroups 当前顺序）
+  const applyPerOwnerLimit = () => {
+    const lim = parseInt(perOwnerLimit, 10);
+    if (!Number.isFinite(lim) || lim <= 0) {
+      // 不限额：直接全选当前过滤结果
+      setPickedIds(new Set(filteredGroups.map(g => g.id)));
+      return;
+    }
+    const counts = new Map();
+    const newPicked = new Set(pickedIds);
+    for (const g of filteredGroups) {
+      const o = (g.owner && g.owner.name) || "(未知)";
+      const n = counts.get(o) || 0;
+      if (n >= lim) continue;
+      counts.set(o, n + 1);
+      newPicked.add(g.id);
+    }
+    setPickedIds(newPicked);
+  };
 
   const pickedGroups = groups.filter(g => pickedIds.has(g.id));
 
@@ -176,6 +211,17 @@ const BroadcastModal = ({ open, onClose, groups, onSent, prefillGroup }) => {
               toggle={toggle}
               query={query} setQuery={setQuery}
               filter={filter} setFilter={setFilter}
+              ownerStats={ownerStats}
+              selectedOwners={selectedOwners}
+              toggleOwner={(name) => setSelectedOwners(prev => {
+                const s = new Set(prev);
+                if (s.has(name)) s.delete(name); else s.add(name);
+                return s;
+              })}
+              clearOwners={() => setSelectedOwners(new Set())}
+              perOwnerLimit={perOwnerLimit}
+              setPerOwnerLimit={setPerOwnerLimit}
+              applyPerOwnerLimit={applyPerOwnerLimit}
               selectAll={() => setPickedIds(new Set(filteredGroups.map(g => g.id)))}
               clearAll={() => setPickedIds(new Set())}
               errors={errors}
@@ -268,13 +314,34 @@ const StepDot = ({ n, label, active, done }) => (
   </div>
 );
 
-const PickGroups = ({ groups, pickedIds, toggle, query, setQuery, filter, setFilter, selectAll, clearAll, errors, total }) => {
+const PickGroups = ({
+  groups, pickedIds, toggle,
+  query, setQuery,
+  filter, setFilter,
+  ownerStats, selectedOwners, toggleOwner, clearOwners,
+  perOwnerLimit, setPerOwnerLimit, applyPerOwnerLimit,
+  selectAll, clearAll, errors, total,
+}) => {
+  const [showAllOwners, setShowAllOwners] = React.useState(false);
   const filters = [
     { id: "all", label: "全部" },
     { id: "vip", label: "VIP / 高价值" },
     { id: "renewal", label: "续约期" },
     { id: "alert", label: "待回复" },
   ];
+  // 群主选择默认显示前 8 个，"更多"展开全部
+  const visibleOwners = showAllOwners ? ownerStats : ownerStats.slice(0, 8);
+
+  // 过滤后按群主分组统计
+  const ownerCountInFiltered = React.useMemo(() => {
+    const m = new Map();
+    for (const g of groups) {
+      const o = (g.owner && g.owner.name) || "(未知)";
+      m.set(o, (m.get(o) || 0) + 1);
+    }
+    return m;
+  }, [groups]);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -284,14 +351,14 @@ const PickGroups = ({ groups, pickedIds, toggle, query, setQuery, filter, setFil
           display: "flex", alignItems: "center", gap: 8,
         }}>
           <Icon name="search" size={14} color="var(--ink-3)"/>
-          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索群或公司"
+          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索群或公司（如：增购）"
             style={{ flex: 1, background: "transparent", border: "none", fontSize: 13 }}/>
         </div>
-        <Btn variant="ghost" size="sm" onClick={selectAll}>全选</Btn>
+        <Btn variant="ghost" size="sm" onClick={selectAll}>全选过滤后</Btn>
         <Btn variant="ghost" size="sm" onClick={clearAll}>清空</Btn>
       </div>
 
-      <div style={{ display: "flex", gap: 4 }}>
+      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
         {filters.map(f => (
           <button key={f.id} onClick={() => setFilter(f.id)}
             style={{
@@ -301,6 +368,72 @@ const PickGroups = ({ groups, pickedIds, toggle, query, setQuery, filter, setFil
               border: `1px solid ${filter === f.id ? "var(--ink)" : "var(--line)"}`,
             }}>{f.label}</button>
         ))}
+      </div>
+
+      {/* 群主多选 */}
+      <div style={{ background: "var(--bg-sunk)", borderRadius: 10, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <div style={{ fontSize: 12, color: "var(--ink-3)" }}>
+            按群主筛选 {selectedOwners.size > 0 && <span style={{ color: "var(--ink)" }}>· 已选 {selectedOwners.size} 人</span>}
+          </div>
+          {selectedOwners.size > 0 && (
+            <button onClick={clearOwners} style={{ fontSize: 11, color: "var(--ink-3)" }}>清除</button>
+          )}
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {visibleOwners.map(([name, count]) => {
+            const on = selectedOwners.has(name);
+            return (
+              <button key={name} onClick={() => toggleOwner(name)}
+                style={{
+                  padding: "4px 10px", borderRadius: 999, fontSize: 12,
+                  background: on ? "var(--ink)" : "var(--bg-elev)",
+                  color: on ? "var(--bg-elev)" : "var(--ink)",
+                  border: `1px solid ${on ? "var(--ink)" : "var(--line)"}`,
+                }}>
+                {name} <span style={{ opacity: 0.6 }}>{count}</span>
+              </button>
+            );
+          })}
+          {!showAllOwners && ownerStats.length > 8 && (
+            <button onClick={() => setShowAllOwners(true)} style={{ padding: "4px 10px", fontSize: 12, color: "var(--ink-3)" }}>
+              +{ownerStats.length - 8} 更多 ▼
+            </button>
+          )}
+        </div>
+
+        {/* 每群主限额 */}
+        <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4 }}>
+          <span style={{ fontSize: 12, color: "var(--ink-3)" }}>每群主最多</span>
+          <input
+            type="number" min="1" placeholder="不限"
+            value={perOwnerLimit}
+            onChange={e => setPerOwnerLimit(e.target.value)}
+            style={{
+              width: 64, padding: "4px 8px", borderRadius: 6,
+              border: "1px solid var(--line)", fontSize: 12, textAlign: "center",
+              background: "var(--bg-elev)",
+            }}
+          />
+          <span style={{ fontSize: 12, color: "var(--ink-3)" }}>个</span>
+          <Btn variant="primary" size="sm" onClick={applyPerOwnerLimit}>
+            按规则勾选 ({groups.length} 候选)
+          </Btn>
+        </div>
+
+        {/* 过滤后每群主多少 */}
+        {groups.length > 0 && groups.length < total && (
+          <div style={{ fontSize: 11.5, color: "var(--ink-3)", display: "flex", flexWrap: "wrap", gap: 8 }}>
+            过滤后:
+            {[...ownerCountInFiltered.entries()]
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 6)
+              .map(([n, c]) => (
+                <span key={n}><b style={{ color: "var(--ink)" }}>{n}</b> {c} 个</span>
+              ))}
+            {ownerCountInFiltered.size > 6 && <span>...</span>}
+          </div>
+        )}
       </div>
 
       {errors.groups && (
