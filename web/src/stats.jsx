@@ -360,8 +360,6 @@ const StatsOverview = ({ D, broadcasts, onAlertOpen }) => {
         <SentimentDonut items={D.sentimentBreakdown} />
         <SpeakerBars speakers={D.speakerDist} />
       </div>
-
-      <BroadcastsCard items={broadcasts} />
     </div>
   );
 };

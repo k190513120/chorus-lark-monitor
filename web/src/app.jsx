@@ -50,12 +50,12 @@ function App() {
               activeId={activeId}
               onSelect={g => setActiveId(g.id)}
             />
-            <div className="scroll" style={{ flex: 1, overflowY: "auto", background: "var(--bg-sunk)" }}>
-              <div style={{ padding: "18px 22px 0" }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, background: "var(--bg-sunk)", overflow: "hidden" }}>
+              <div style={{ padding: "18px 22px 0", flexShrink: 0 }}>
                 <StatsOverview D={AppData.DASHBOARD} broadcasts={broadcasts} onAlertOpen={g => setActiveId(g.id)} />
               </div>
-              <div style={{ padding: "18px 22px 22px" }}>
-                <Card padded={false} style={{ overflow: "hidden", height: "calc(100vh - 470px)", minHeight: 560, display: "flex", flexDirection: "column" }}>
+              <div style={{ padding: "18px 22px 22px", flex: 1, minHeight: 0, display: "flex" }}>
+                <Card padded={false} style={{ overflow: "hidden", flex: 1, minHeight: 320, display: "flex", flexDirection: "column" }}>
                   {activeGroup && <DetailPane group={activeGroup} />}
                 </Card>
               </div>
