@@ -1,9 +1,11 @@
 name: Daily Feishu Sync
 
 on:
-  schedule:
-    # 北京时间 10:00 = UTC 02:00
-    - cron: '0 2 * * *'
+  # NOTE: schedule 已被禁用 — Koyeb 服务（chorus-lark-monitor）的内部 APScheduler
+  # 在 02:00 UTC 接管了这个任务，避免双跑撞 --refresh-metadata-tables 表 race。
+  # 出现 Koyeb 故障时手动 dispatch 当容灾用。
+  # schedule:
+  #   - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       max_chats:

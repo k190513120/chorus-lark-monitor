@@ -1,9 +1,9 @@
 name: Ensure Bot in External Groups
 
 on:
-  schedule:
-    # 北京时间 22:00 = UTC 14:00
-    - cron: '0 14 * * *'
+  # NOTE: schedule 已被禁用 — Koyeb 服务接管 14:00 UTC 触发。手动 dispatch 当容灾。
+  # schedule:
+  #   - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
       dry_run:

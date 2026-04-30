@@ -1,9 +1,9 @@
 name: Refresh Bulk Message Stats
 
 on:
-  schedule:
-    # 北京时间 20:00 = UTC 12:00（一天一次，业务结束时刷新近 7 天群发的已读/回复统计）
-    - cron: '0 12 * * *'
+  # NOTE: schedule 已被禁用 — Koyeb 服务接管 12:00 UTC 触发。手动 dispatch 当容灾。
+  # schedule:
+  #   - cron: '0 12 * * *'
   workflow_dispatch:
     inputs:
       max_age_days:
