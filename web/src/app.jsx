@@ -3,8 +3,12 @@
 const { useState, useEffect } = React;
 
 function App() {
+  const groups = AppData.GROUPS || [];
+  const broadcasts = AppData.BROADCASTS || [];
+
+  const [activeTab, setActiveTab] = useState(() => localStorage.getItem("cm.activeTab") || "dashboard");
   const [activeId, setActiveId] = useState(() => {
-    return localStorage.getItem("cm.activeId") || AppData.GROUPS[0].id;
+    return localStorage.getItem("cm.activeId") || (groups[0] && groups[0].id) || "";
   });
   const [broadcastOpen, setBroadcastOpen] = useState(false);
   const [broadcastPrefill, setBroadcastPrefill] = useState(null);
@@ -14,6 +18,7 @@ function App() {
 
   useEffect(() => { window.applyTweaks(tweaks); }, []);
   useEffect(() => { localStorage.setItem("cm.activeId", activeId); }, [activeId]);
+  useEffect(() => { localStorage.setItem("cm.activeTab", activeTab); }, [activeTab]);
 
   // Edit-mode host protocol
   useEffect(() => {
@@ -27,34 +32,57 @@ function App() {
     return () => window.removeEventListener("message", onMsg);
   }, []);
 
-  const activeGroup = AppData.GROUPS.find(g => g.id === activeId) || AppData.GROUPS[0];
+  const activeGroup = groups.find(g => g.id === activeId) || groups[0];
+  const openBroadcastWizard = (prefill = null) => {
+    setBroadcastPrefill(prefill);
+    setBroadcastOpen(true);
+  };
+  const switchToBroadcastTab = () => setActiveTab("broadcast");
 
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
-      <TopBar onOpenBroadcast={() => { setBroadcastPrefill(null); setBroadcastOpen(true); }}/>
+      <TopBar
+        activeTab={activeTab}
+        onSelectTab={setActiveTab}
+        onOpenBroadcast={openBroadcastWizard}
+      />
       <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
-        <GroupList
-          groups={AppData.GROUPS}
-          activeId={activeId}
-          onSelect={g => setActiveId(g.id)}
-          onOpenBroadcast={() => { setBroadcastPrefill(null); setBroadcastOpen(true); }}
-        />
-        <div className="scroll" style={{ flex: 1, overflowY: "auto", background: "var(--bg-sunk)" }}>
-          <div style={{ padding: "18px 22px 0" }}>
-            <StatsOverview D={AppData.DASHBOARD} broadcasts={AppData.BROADCASTS} onAlertOpen={g => setActiveId(g.id)} />
+        {activeTab === "dashboard" && (
+          <>
+            <GroupList
+              groups={groups}
+              activeId={activeId}
+              onSelect={g => setActiveId(g.id)}
+              onOpenBroadcast={() => openBroadcastWizard()}
+            />
+            <div className="scroll" style={{ flex: 1, overflowY: "auto", background: "var(--bg-sunk)" }}>
+              <div style={{ padding: "18px 22px 0" }}>
+                <StatsOverview D={AppData.DASHBOARD} broadcasts={broadcasts} onAlertOpen={g => setActiveId(g.id)} />
+              </div>
+              <div style={{ padding: "18px 22px 22px" }}>
+                <Card padded={false} style={{ overflow: "hidden", height: "calc(100vh - 470px)", minHeight: 560, display: "flex", flexDirection: "column" }}>
+                  {activeGroup && <DetailPane group={activeGroup} />}
+                </Card>
+              </div>
+            </div>
+          </>
+        )}
+
+        {activeTab === "broadcast" && (
+          <div className="scroll" style={{ flex: 1, overflowY: "auto", background: "var(--bg-sunk)" }}>
+            <BroadcastView
+              broadcasts={broadcasts}
+              groupCount={groups.length}
+              onNew={() => openBroadcastWizard()}
+            />
           </div>
-          <div style={{ padding: "18px 22px 22px" }}>
-            <Card padded={false} style={{ overflow: "hidden", height: "calc(100vh - 470px)", minHeight: 560, display: "flex", flexDirection: "column" }}>
-              <DetailPane group={activeGroup} />
-            </Card>
-          </div>
-        </div>
+        )}
       </div>
 
       <BroadcastModal
         open={broadcastOpen}
         onClose={() => setBroadcastOpen(false)}
-        groups={AppData.GROUPS}
+        groups={groups}
         prefillGroup={broadcastPrefill}
       />
 
@@ -65,7 +93,13 @@ function App() {
   );
 }
 
-const TopBar = ({ onOpenBroadcast }) => {
+const TopBar = ({ activeTab, onSelectTab, onOpenBroadcast }) => {
+  const tabs = [
+    { id: "dashboard", label: "监控看板", real: true },
+    { id: "broadcast", label: "群发消息", real: true },
+    { id: "team", label: "团队", real: false },
+    { id: "settings", label: "设置", real: false },
+  ];
   return (
     <header style={{
       height: 56, padding: "0 22px",
@@ -91,14 +125,25 @@ const TopBar = ({ onOpenBroadcast }) => {
       </div>
 
       <nav style={{ display: "flex", gap: 4, marginLeft: 14 }}>
-        {["监控看板", "团队", "客户画像", "设置"].map((t, i) => (
-          <button key={t} style={{
-            padding: "6px 12px", fontSize: 13, borderRadius: 8,
-            color: i === 0 ? "var(--ink)" : "var(--ink-3)",
-            background: i === 0 ? "var(--bg-sunk)" : "transparent",
-            fontWeight: i === 0 ? 500 : 400,
-          }}>{t}</button>
-        ))}
+        {tabs.map((t) => {
+          const active = activeTab === t.id;
+          return (
+            <button
+              key={t.id}
+              onClick={() => t.real && onSelectTab(t.id)}
+              disabled={!t.real}
+              title={t.real ? "" : "敬请期待"}
+              style={{
+                padding: "6px 12px", fontSize: 13, borderRadius: 8,
+                color: active ? "var(--ink)" : "var(--ink-3)",
+                background: active ? "var(--bg-sunk)" : "transparent",
+                fontWeight: active ? 500 : 400,
+                cursor: t.real ? "pointer" : "not-allowed",
+                opacity: t.real ? 1 : 0.5,
+              }}
+            >{t.label}</button>
+          );
+        })}
       </nav>
 
       <div style={{ flex: 1 }}/>

@@ -31,6 +31,16 @@ const BroadcastModal = ({ open, onClose, groups, onSent, prefillGroup }) => {
     }
   }, [open, prefillGroup]);
 
+  // 群主清单 + 每人群数（用于群主多选 UI）—— useMemo 必须在条件 return 之前调用
+  const ownerStats = React.useMemo(() => {
+    const m = new Map();
+    for (const g of (groups || [])) {
+      const name = (g.owner && g.owner.name) || "(未知)";
+      m.set(name, (m.get(name) || 0) + 1);
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1]);  // 按群数降序
+  }, [groups]);
+
   if (!open) return null;
 
   const toggle = (id) => {
@@ -40,16 +50,6 @@ const BroadcastModal = ({ open, onClose, groups, onSent, prefillGroup }) => {
       return s;
     });
   };
-
-  // 群主清单 + 每人群数（用于群主多选 UI）
-  const ownerStats = React.useMemo(() => {
-    const m = new Map();
-    for (const g of groups) {
-      const name = (g.owner && g.owner.name) || "(未知)";
-      m.set(name, (m.get(name) || 0) + 1);
-    }
-    return [...m.entries()].sort((a, b) => b[1] - a[1]);  // 按群数降序
-  }, [groups]);
 
   const filteredGroups = groups.filter(g => {
     if (query && !g.name.includes(query) && !g.company.includes(query)) return false;
@@ -727,4 +727,100 @@ const SendProgress = ({ pickedGroups, progress, text, sent, scheduled, scheduleT
   );
 };
 
-Object.assign(window, { BroadcastModal });
+// 群发消息 tab 页：列出历史群发任务，提供"新建"入口（点开后打开 BroadcastModal 向导）
+const BroadcastView = ({ broadcasts, groupCount, onNew }) => {
+  const formatPct = (v) => `${(v * 100).toFixed(1)}%`;
+  const sorted = (broadcasts || []).slice().sort((a, b) => (b.sentAtMs || 0) - (a.sentAtMs || 0));
+  return (
+    <div style={{ padding: "22px 28px", display: "flex", flexDirection: "column", gap: 18, maxWidth: 1200, margin: "0 auto" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <div style={{ fontSize: 22, fontWeight: 600 }}>群发消息</div>
+          <div style={{ fontSize: 13, color: "var(--ink-3)", marginTop: 4 }}>
+            可发送范围 {groupCount} 个群 · 已记录 {sorted.length} 次群发任务
+          </div>
+        </div>
+        <Btn variant="primary" size="md" icon={<Icon name="send" size={14}/>} onClick={onNew}>
+          新建群发任务
+        </Btn>
+      </div>
+
+      <Card style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ padding: "14px 18px", borderBottom: "1px solid var(--line)" }}>
+          <div style={{ fontSize: 14, fontWeight: 500 }}>历史任务</div>
+          <div style={{ fontSize: 12, color: "var(--ink-3)", marginTop: 2 }}>
+            已读率 / 回复率排除内部 tenant；statistics 每天 20:00 自动滚动刷新
+          </div>
+        </div>
+        {sorted.length === 0 ? (
+          <div style={{ padding: 40, textAlign: "center", color: "var(--ink-3)" }}>
+            还没有群发记录。点击右上角"新建群发任务"开始第一条。
+          </div>
+        ) : (
+          <div>
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "1.4fr 110px 90px 110px 130px 110px",
+              gap: 12,
+              padding: "10px 18px",
+              fontSize: 11.5,
+              color: "var(--ink-3)",
+              background: "var(--bg-sunk)",
+            }}>
+              <div>任务标题 / 时间</div>
+              <div style={{ textAlign: "right" }}>群数</div>
+              <div style={{ textAlign: "right" }}>受众</div>
+              <div style={{ textAlign: "right" }}>已读率</div>
+              <div style={{ textAlign: "right" }}>回复率</div>
+              <div style={{ textAlign: "right" }}>采集时间</div>
+            </div>
+            {sorted.map((b) => {
+              const heatColor = (rate) => {
+                if (rate >= 0.6) return "oklch(0.55 0.13 155)";
+                if (rate >= 0.3) return "oklch(0.55 0.13 75)";
+                return "oklch(0.55 0.13 20)";
+              };
+              return (
+                <div key={b.batchId} style={{
+                  display: "grid",
+                  gridTemplateColumns: "1.4fr 110px 90px 110px 130px 110px",
+                  gap: 12,
+                  padding: "12px 18px",
+                  fontSize: 13,
+                  alignItems: "center",
+                  borderTop: "1px solid var(--line)",
+                }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={b.text}>
+                      {b.title}
+                    </div>
+                    <div style={{ fontSize: 11.5, color: "var(--ink-3)", marginTop: 2 }}>
+                      {b.sentAtText || "—"}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: "right", color: b.failureCount ? "oklch(0.55 0.12 20)" : "var(--ink)" }} className="num">
+                    {b.successCount}{b.failureCount ? ` / -${b.failureCount}` : ""}
+                  </div>
+                  <div style={{ textAlign: "right" }} className="num">{b.targetAudience}</div>
+                  <div style={{ textAlign: "right", color: heatColor(b.avgReadRate), fontWeight: 500 }} className="num">
+                    {formatPct(b.avgReadRate)}
+                    <span style={{ color: "var(--ink-3)", fontWeight: 400, fontSize: 11 }}> ({b.readCount})</span>
+                  </div>
+                  <div style={{ textAlign: "right", color: heatColor(b.avgReplyRate), fontWeight: 500 }} className="num">
+                    {formatPct(b.avgReplyRate)}
+                    <span style={{ color: "var(--ink-3)", fontWeight: 400, fontSize: 11 }}> ({b.replyUniqueSenders}人/{b.replyCount}条)</span>
+                  </div>
+                  <div style={{ textAlign: "right", fontSize: 11.5, color: "var(--ink-3)" }}>
+                    {b.collectedAtText ? b.collectedAtText.slice(5, 16) : "—"}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+};
+
+Object.assign(window, { BroadcastModal, BroadcastView });
