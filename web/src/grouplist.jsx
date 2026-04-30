@@ -65,7 +65,7 @@ const GroupListItem = ({ group, active, onClick }) => {
   );
 };
 
-const GroupList = ({ groups, activeId, onSelect, onOpenBroadcast }) => {
+const GroupList = ({ groups, activeId, onSelect }) => {
   const [query, setQuery] = React.useState("");
   const [filter, setFilter] = React.useState("all");
 
@@ -98,17 +98,11 @@ const GroupList = ({ groups, activeId, onSelect, onOpenBroadcast }) => {
     }}>
       {/* header */}
       <div style={{ padding: "16px 16px 10px" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-          <div>
-            <div style={{ fontSize: 15, fontWeight: 600 }}>群聊监控</div>
-            <div style={{ fontSize: 11.5, color: "var(--ink-3)", marginTop: 1 }}>
-              <span className="num">{groups.length}</span> 个活跃群 · 实时同步
-            </div>
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 15, fontWeight: 600 }}>群聊监控</div>
+          <div style={{ fontSize: 11.5, color: "var(--ink-3)", marginTop: 1 }}>
+            <span className="num">{groups.length}</span> 个活跃群 · 实时同步
           </div>
-          <Btn variant="primary" size="sm" icon={<Icon name="send" size={12}/>}
-            onClick={onOpenBroadcast}>
-            群发消息
-          </Btn>
         </div>
 
         <div style={{

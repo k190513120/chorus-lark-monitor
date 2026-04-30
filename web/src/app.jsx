@@ -41,11 +41,7 @@ function App() {
 
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
-      <TopBar
-        activeTab={activeTab}
-        onSelectTab={setActiveTab}
-        onOpenBroadcast={openBroadcastWizard}
-      />
+      <TopBar activeTab={activeTab} onSelectTab={setActiveTab} />
       <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
         {activeTab === "dashboard" && (
           <>
@@ -53,7 +49,6 @@ function App() {
               groups={groups}
               activeId={activeId}
               onSelect={g => setActiveId(g.id)}
-              onOpenBroadcast={() => openBroadcastWizard()}
             />
             <div className="scroll" style={{ flex: 1, overflowY: "auto", background: "var(--bg-sunk)" }}>
               <div style={{ padding: "18px 22px 0" }}>
@@ -93,7 +88,7 @@ function App() {
   );
 }
 
-const TopBar = ({ activeTab, onSelectTab, onOpenBroadcast }) => {
+const TopBar = ({ activeTab, onSelectTab }) => {
   const tabs = [
     { id: "dashboard", label: "监控看板", real: true },
     { id: "broadcast", label: "群发消息", real: true },
@@ -161,10 +156,6 @@ const TopBar = ({ activeTab, onSelectTab, onOpenBroadcast }) => {
           实时同步中
         </span>
       </div>
-
-      <Btn variant="primary" size="md" icon={<Icon name="send" size={13}/>} onClick={onOpenBroadcast}>
-        群发消息
-      </Btn>
 
       <div style={{
         width: 34, height: 34, borderRadius: 999,
