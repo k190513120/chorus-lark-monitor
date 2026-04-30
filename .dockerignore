@@ -1,0 +1,13 @@
+.git
+.github
+.wrangler
+.bulk_message_probe_state.json
+.feishu_group_join_*.json
+.external_group_join_state.json
+.sync_state.test.json
+__pycache__
+*.pyc
+.venv
+.env
+logs
+README.md
