@@ -14,9 +14,9 @@ Endpoints:
   WS   /ws/bulk-progress/{id}     stream a bulk job's progress
 
 Cron tasks (managed by APScheduler):
-  daily-sync         -> sync_feishu_groups_to_base.main() at 02:00 UTC
-  external-join      -> ensure_bot_in_external_chats.main() at 14:00 UTC
-  bulk-stats-refresh -> bulk_message_probe.cmd_refresh() at 12:00 UTC
+  daily-sync         -> sync_feishu_groups_to_base.main() at 16:00 UTC (= SGT 00:00)
+  external-join      -> ensure_bot_in_external_chats.main() at 14:00 UTC (= SGT 22:00)
+  bulk-stats-refresh -> bulk_message_probe.cmd_refresh() at 12:00 UTC (= SGT 20:00)
 """
 from __future__ import annotations
 
@@ -149,9 +149,11 @@ def _start_scheduler() -> AsyncIOScheduler:
         sch.start()
         return sch
 
+    # Singapore 00:00 = UTC 16:00（前一天）。在新加坡数据中心是真·跨日界点，
+    # 业务侧也希望"昨天的全量同步今天上班前已就绪"。
     sch.add_job(
         _job_daily_sync,
-        CronTrigger(hour=2, minute=0, timezone="UTC"),
+        CronTrigger(hour=16, minute=0, timezone="UTC"),
         id="daily-sync",
         replace_existing=True,
         max_instances=1,
