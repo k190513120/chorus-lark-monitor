@@ -760,13 +760,18 @@ def _process_message_event(body: dict) -> None:
 
         sync_run_id = "event-" + datetime.now(SYNC_TZ).strftime("%Y%m%d%H%M%S")
         row = build_message_row(synthetic_msg, "", chat_record_id, sync_run_id, SYNC_TZ)
+        # 关联群组 link 在 BASE_MESSAGE_FIELD_DEFS 里是第 4 列（index 3）。
+        # 当 chat_record_id 为空（如 bot 刚加群，cache 还没更新），跳过 link，
+        # 否则 [{"id": ""}] 会被 Base 拒掉 invalid_request。
+        if not chat_record_id:
+            row[3] = None
         message_field_defs = materialize_field_defs(BASE_MESSAGE_FIELD_DEFS, chat_table_id)
         message_fields = [f["name"] for f in message_field_defs]
         state["client"].batch_create_records(
             state["base_token"], msg_table_id, message_fields, [row]
         )
         _bump_persist_count("message")
-        log.info("[event/message] persisted msg=%s chat=%s", message_id, chat_id)
+        log.info("[event/message] persisted msg=%s chat=%s record_id=%s", message_id, chat_id, chat_record_id or "(missing)")
     except Exception:
         log.exception("[event/message] failed")
 
@@ -814,6 +819,10 @@ def _process_member_added_event(body: dict) -> None:
         rows = build_member_rows(chat_id, chat_name, chat_record_id, members, sync_run_id)
         if not rows:
             return
+        # 关联群组 link 在 BASE_MEMBER_FIELD_DEFS 里是第 3 列（index 2）。
+        if not chat_record_id:
+            for r in rows:
+                r[2] = None
         member_field_defs = materialize_field_defs(BASE_MEMBER_FIELD_DEFS, chat_table_id)
         member_fields = [f["name"] for f in member_field_defs]
         state["client"].batch_create_records(
