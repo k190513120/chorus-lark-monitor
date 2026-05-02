@@ -626,6 +626,162 @@ async def get_bulk_status(batch_id: str) -> dict:
     return _public_job_view(job)
 
 
+# ─── /api/bulk-send/refresh — 手动触发群发任务统计刷新 ────────────────────────
+
+_manual_refresh_state: dict[str, Any] = {
+    "running": False,
+    "started_at": None,
+    "ended_at": None,
+    "last_error": None,
+}
+_manual_refresh_lock = threading.Lock()
+
+
+def _run_manual_refresh(max_age_days: int) -> None:
+    with _manual_refresh_lock:
+        _manual_refresh_state.update({
+            "running": True,
+            "started_at": int(time.time()),
+            "ended_at": None,
+            "last_error": None,
+        })
+    try:
+        rc = _run_script(
+            "bulk_message_probe",
+            ["refresh", "--max-age-days", str(max_age_days)],
+            "manual-bulk-refresh",
+        )
+        # 让下次 dashboard 拉取时获取新数据
+        _dashboard_cache["data"] = None
+        _dashboard_cache["expires_at"] = 0
+        _manual_refresh_state.update({
+            "running": False,
+            "ended_at": int(time.time()),
+            "last_rc": rc,
+        })
+    except Exception as exc:
+        _manual_refresh_state.update({
+            "running": False,
+            "ended_at": int(time.time()),
+            "last_error": str(exc)[:500],
+        })
+
+
+@app.post("/api/bulk-send/refresh")
+async def manual_bulk_refresh(max_age_days: int = 7) -> dict:
+    """手动触发 bulk-stats refresh。返回立即；前端可以轮询 GET /api/bulk-send/refresh/status 看进度。"""
+    if _manual_refresh_state.get("running"):
+        return {
+            "ok": False,
+            "running": True,
+            "started_at": _manual_refresh_state.get("started_at"),
+            "message": "已经在跑，请等当前 refresh 完成",
+        }
+    asyncio.create_task(asyncio.to_thread(_run_manual_refresh, max_age_days))
+    return {"ok": True, "queued": True, "max_age_days": max_age_days}
+
+
+@app.get("/api/bulk-send/refresh/status")
+async def manual_bulk_refresh_status() -> dict:
+    return dict(_manual_refresh_state)
+
+
+# ─── /api/broadcast/analysis — 群发数据分析报告 ──────────────────────────────
+
+@app.get("/api/broadcast/analysis")
+async def broadcast_analysis() -> dict:
+    """从 BROADCASTS 数据聚合出可读的分析报告。"""
+    payload = await _get_or_build_dashboard_payload()
+    broadcasts: list[dict] = list(payload.get("BROADCASTS") or [])
+
+    # 全局 KPI
+    total_batches = len(broadcasts)
+    total_chats = sum(int(b.get("chatCount") or 0) for b in broadcasts)
+    total_success = sum(int(b.get("successCount") or 0) for b in broadcasts)
+    total_failure = sum(int(b.get("failureCount") or 0) for b in broadcasts)
+    total_audience = sum(int(b.get("targetAudience") or 0) for b in broadcasts)
+    total_read = sum(int(b.get("readCount") or 0) for b in broadcasts)
+    total_reply = sum(int(b.get("replyCount") or 0) for b in broadcasts)
+    total_reply_users = sum(int(b.get("replyUniqueSenders") or 0) for b in broadcasts)
+
+    avg_read_rate = total_read / total_audience if total_audience else 0.0
+    avg_reply_rate = total_reply_users / total_audience if total_audience else 0.0
+
+    # 任务级排序（按已读率）
+    sorted_by_read = sorted(
+        broadcasts,
+        key=lambda b: float(b.get("avgReadRate") or 0),
+        reverse=True,
+    )
+    top_tasks = sorted_by_read[:5]
+    bottom_tasks = sorted_by_read[-5:][::-1] if len(sorted_by_read) >= 5 else []
+
+    # 群级聚合：同一群在多次群发里的整体表现
+    chat_aggregates: dict[str, dict] = {}
+    for b in broadcasts:
+        for c in (b.get("chats") or []):
+            cid = c.get("chatId")
+            if not cid:
+                continue
+            entry = chat_aggregates.setdefault(cid, {
+                "chatId": cid,
+                "chatName": c.get("chatName") or "",
+                "broadcastCount": 0,
+                "totalReadRate": 0.0,
+                "totalReplyRate": 0.0,
+                "anyRead": False,
+                "anyReply": False,
+            })
+            if c.get("chatName"):
+                entry["chatName"] = c["chatName"]
+            entry["broadcastCount"] += 1
+            entry["totalReadRate"] += float(c.get("readRate") or 0)
+            entry["totalReplyRate"] += float(c.get("replyRate") or 0)
+            if (c.get("readRate") or 0) > 0:
+                entry["anyRead"] = True
+            if (c.get("replyRate") or 0) > 0:
+                entry["anyReply"] = True
+    for entry in chat_aggregates.values():
+        n = max(entry["broadcastCount"], 1)
+        entry["avgReadRate"] = round(entry["totalReadRate"] / n, 4)
+        entry["avgReplyRate"] = round(entry["totalReplyRate"] / n, 4)
+        del entry["totalReadRate"]
+        del entry["totalReplyRate"]
+
+    chat_list = list(chat_aggregates.values())
+    # 沉默群：被群发 ≥2 次但没人读
+    silent_chats = sorted(
+        [c for c in chat_list if c["broadcastCount"] >= 2 and not c["anyRead"]],
+        key=lambda c: -c["broadcastCount"],
+    )[:20]
+    # 高质量群：平均已读率 ≥ 50% 的群（受过多次群发）
+    high_quality_chats = sorted(
+        [c for c in chat_list if c["broadcastCount"] >= 2 and c["avgReadRate"] >= 0.5],
+        key=lambda c: -c["avgReadRate"],
+    )[:20]
+
+    return {
+        "generatedAt": int(time.time()),
+        "kpis": {
+            "totalBatches": total_batches,
+            "totalChatRows": total_chats,
+            "totalSuccess": total_success,
+            "totalFailure": total_failure,
+            "successRate": round(total_success / total_chats, 4) if total_chats else 0.0,
+            "totalAudience": total_audience,
+            "totalRead": total_read,
+            "totalReply": total_reply,
+            "totalReplyUsers": total_reply_users,
+            "avgReadRate": round(avg_read_rate, 4),
+            "avgReplyRate": round(avg_reply_rate, 4),
+        },
+        "topTasks": top_tasks,
+        "bottomTasks": bottom_tasks,
+        "silentChats": silent_chats,
+        "highQualityChats": high_quality_chats,
+    }
+
+
 @app.websocket("/ws/bulk-progress/{batch_id}")
 async def bulk_progress_ws(ws: WebSocket, batch_id: str) -> None:
     await ws.accept()

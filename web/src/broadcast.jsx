@@ -731,6 +731,45 @@ const SendProgress = ({ pickedGroups, progress, text, sent, scheduled, scheduleT
 const BroadcastView = ({ broadcasts, groupCount, onNew }) => {
   const formatPct = (v) => `${(v * 100).toFixed(1)}%`;
   const sorted = (broadcasts || []).slice().sort((a, b) => (b.sentAtMs || 0) - (a.sentAtMs || 0));
+
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [refreshMsg, setRefreshMsg] = React.useState("");
+  const [analysisOpen, setAnalysisOpen] = React.useState(false);
+
+  const handleRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setRefreshMsg("已触发，约 30 秒...");
+    try {
+      const r = await fetch("/api/bulk-send/refresh?max_age_days=7", { method: "POST" });
+      const j = await r.json();
+      if (!j.ok && j.running) {
+        setRefreshMsg("已经在跑，等当前完成");
+      }
+      // 轮询状态
+      let attempts = 0;
+      const poll = setInterval(async () => {
+        attempts += 1;
+        try {
+          const sr = await fetch("/api/bulk-send/refresh/status").then(x => x.json());
+          if (!sr.running && sr.ended_at) {
+            clearInterval(poll);
+            const dur = sr.ended_at - sr.started_at;
+            setRefreshMsg(`✓ 刷新完成（耗时 ${dur}s），即将重载...`);
+            setTimeout(() => window.location.reload(), 1200);
+          } else if (attempts > 60) {
+            clearInterval(poll);
+            setRefreshing(false);
+            setRefreshMsg("超时，请手动刷新页面");
+          }
+        } catch (e) { /* keep polling */ }
+      }, 2000);
+    } catch (e) {
+      setRefreshing(false);
+      setRefreshMsg("失败：" + e.message);
+    }
+  };
+
   return (
     <div style={{ padding: "22px 28px", display: "flex", flexDirection: "column", gap: 18, maxWidth: 1200, margin: "0 auto" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -738,12 +777,24 @@ const BroadcastView = ({ broadcasts, groupCount, onNew }) => {
           <div style={{ fontSize: 22, fontWeight: 600 }}>群发消息</div>
           <div style={{ fontSize: 13, color: "var(--ink-3)", marginTop: 4 }}>
             可发送范围 {groupCount} 个群 · 已记录 {sorted.length} 次群发任务
+            {refreshMsg && <span style={{ marginLeft: 12, color: "var(--accent)" }}>{refreshMsg}</span>}
           </div>
         </div>
-        <Btn variant="primary" size="md" icon={<Icon name="send" size={14}/>} onClick={onNew}>
-          新建群发任务
-        </Btn>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn variant="outline" size="md" onClick={() => setAnalysisOpen(true)}>
+            数据分析报告
+          </Btn>
+          <Btn variant="outline" size="md" onClick={handleRefresh} disabled={refreshing}>
+            {refreshing ? "刷新中..." : "刷新统计"}
+          </Btn>
+          <Btn variant="primary" size="md" icon={<Icon name="send" size={14}/>} onClick={onNew}>
+            新建群发任务
+          </Btn>
+        </div>
       </div>
+
+      <BroadcastAnalysisModal open={analysisOpen} onClose={() => setAnalysisOpen(false)} />
+
 
       <Card style={{ padding: 0, overflow: "hidden" }}>
         <div style={{ padding: "14px 18px", borderBottom: "1px solid var(--line)" }}>
@@ -823,4 +874,163 @@ const BroadcastView = ({ broadcasts, groupCount, onNew }) => {
   );
 };
 
-Object.assign(window, { BroadcastModal, BroadcastView });
+// 数据分析报告 modal —— 拉 /api/broadcast/analysis 显示 KPI + 排行 + 沉默群清单
+const BroadcastAnalysisModal = ({ open, onClose }) => {
+  const [data, setData] = React.useState(null);
+  const [loading, setLoading] = React.useState(false);
+  const [err, setErr] = React.useState("");
+
+  React.useEffect(() => {
+    if (!open) return;
+    setLoading(true);
+    setErr("");
+    setData(null);
+    fetch("/api/broadcast/analysis")
+      .then(r => r.json())
+      .then(d => { setData(d); setLoading(false); })
+      .catch(e => { setErr(String(e)); setLoading(false); });
+  }, [open]);
+
+  if (!open) return null;
+
+  const formatPct = (v) => v == null ? "—" : `${(v * 100).toFixed(1)}%`;
+  const heatColor = (rate) => {
+    if (rate >= 0.6) return "oklch(0.55 0.13 155)";
+    if (rate >= 0.3) return "oklch(0.55 0.13 75)";
+    return "oklch(0.55 0.13 20)";
+  };
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, zIndex: 1000,
+      background: "oklch(0.2 0.02 60 / 0.45)",
+      display: "grid", placeItems: "center", padding: 24,
+    }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{
+        width: "min(960px, 100%)", maxHeight: "90vh",
+        background: "var(--bg-elev)", borderRadius: "var(--r-xl)",
+        boxShadow: "var(--sh-3)", overflow: "hidden",
+        display: "flex", flexDirection: "column",
+      }}>
+        <div style={{
+          padding: "16px 22px", display: "flex", alignItems: "center", gap: 14,
+          borderBottom: "1px solid var(--line)",
+        }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 15, fontWeight: 600 }}>数据分析报告</div>
+            <div style={{ fontSize: 12, color: "var(--ink-3)" }}>
+              基于「群发任务记录」表的实时聚合
+            </div>
+          </div>
+          <button onClick={onClose} style={{ width: 30, height: 30, borderRadius: 8, color: "var(--ink-3)", display: "grid", placeItems: "center" }}>
+            <Icon name="x" size={16}/>
+          </button>
+        </div>
+        <div className="scroll" style={{ flex: 1, overflowY: "auto", padding: 22 }}>
+          {loading && <div style={{ textAlign: "center", color: "var(--ink-3)", padding: 40 }}>分析中...</div>}
+          {err && <div style={{ color: "oklch(0.5 0.15 20)", padding: 20 }}>失败：{err}</div>}
+          {data && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
+              {/* KPI 块 */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+                <KpiCell label="任务批次" value={data.kpis.totalBatches} />
+                <KpiCell label="覆盖目标受众" value={data.kpis.totalAudience} />
+                <KpiCell label="平均已读率" value={formatPct(data.kpis.avgReadRate)} color={heatColor(data.kpis.avgReadRate)} />
+                <KpiCell label="平均回复率" value={formatPct(data.kpis.avgReplyRate)} color={heatColor(data.kpis.avgReplyRate)} />
+              </div>
+
+              {/* 任务排行 */}
+              {data.topTasks.length > 0 && (
+                <Section title="🏆 已读率最高的任务">
+                  <TaskList tasks={data.topTasks} formatPct={formatPct} heatColor={heatColor} />
+                </Section>
+              )}
+              {data.bottomTasks.length > 0 && (
+                <Section title="⚠️ 已读率最低的任务">
+                  <TaskList tasks={data.bottomTasks} formatPct={formatPct} heatColor={heatColor} />
+                </Section>
+              )}
+
+              {/* 高质量群 */}
+              {data.highQualityChats.length > 0 && (
+                <Section title={`💎 高互动群（共 ${data.highQualityChats.length} 个，平均已读率 ≥50%）`}>
+                  <ChatList chats={data.highQualityChats} formatPct={formatPct} heatColor={heatColor} />
+                </Section>
+              )}
+
+              {/* 沉默群 */}
+              {data.silentChats.length > 0 && (
+                <Section title={`🔕 沉默群（被群发 ≥2 次但 0 已读，建议清理 ${data.silentChats.length} 个）`}>
+                  <ChatList chats={data.silentChats} formatPct={formatPct} heatColor={heatColor} silent />
+                </Section>
+              )}
+
+              <div style={{ fontSize: 11, color: "var(--ink-3)", textAlign: "right" }}>
+                生成时间：{new Date(data.generatedAt * 1000).toLocaleString()}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const KpiCell = ({ label, value, color }) => (
+  <div style={{ background: "var(--bg-sunk)", borderRadius: 10, padding: 14 }}>
+    <div style={{ fontSize: 11.5, color: "var(--ink-3)" }}>{label}</div>
+    <div style={{ fontSize: 22, fontWeight: 600, marginTop: 4, color: color || "var(--ink)" }} className="num">{value}</div>
+  </div>
+);
+
+const Section = ({ title, children }) => (
+  <div>
+    <div style={{ fontSize: 13, fontWeight: 500, color: "var(--ink-2)", marginBottom: 8 }}>{title}</div>
+    {children}
+  </div>
+);
+
+const TaskList = ({ tasks, formatPct, heatColor }) => (
+  <div style={{ border: "1px solid var(--line)", borderRadius: 10, overflow: "hidden" }}>
+    {tasks.map((t, i) => (
+      <div key={t.batchId} style={{
+        display: "grid", gridTemplateColumns: "1.5fr 90px 110px 110px",
+        padding: "10px 14px", fontSize: 12.5, alignItems: "center",
+        borderTop: i === 0 ? "none" : "1px solid var(--line)",
+      }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{t.title}</div>
+          <div style={{ fontSize: 11, color: "var(--ink-3)" }}>{t.sentAtText}</div>
+        </div>
+        <div style={{ textAlign: "right" }} className="num">{t.targetAudience} 人</div>
+        <div style={{ textAlign: "right", color: heatColor(t.avgReadRate), fontWeight: 500 }} className="num">已读 {formatPct(t.avgReadRate)}</div>
+        <div style={{ textAlign: "right", color: heatColor(t.avgReplyRate), fontWeight: 500 }} className="num">回复 {formatPct(t.avgReplyRate)}</div>
+      </div>
+    ))}
+  </div>
+);
+
+const ChatList = ({ chats, formatPct, heatColor, silent }) => (
+  <div style={{ border: "1px solid var(--line)", borderRadius: 10, overflow: "hidden", maxHeight: 320, overflowY: "auto" }}>
+    {chats.map((c, i) => (
+      <div key={c.chatId} style={{
+        display: "grid", gridTemplateColumns: "1.5fr 80px 110px 110px",
+        padding: "10px 14px", fontSize: 12.5, alignItems: "center",
+        borderTop: i === 0 ? "none" : "1px solid var(--line)",
+      }}>
+        <div style={{ minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={c.chatName || c.chatId}>
+          {c.chatName || c.chatId}
+        </div>
+        <div style={{ textAlign: "right", color: "var(--ink-3)" }}>{c.broadcastCount} 次</div>
+        <div style={{ textAlign: "right", color: silent ? "var(--ink-3)" : heatColor(c.avgReadRate), fontWeight: 500 }} className="num">
+          已读 {silent ? "0%" : formatPct(c.avgReadRate)}
+        </div>
+        <div style={{ textAlign: "right", color: silent ? "var(--ink-3)" : heatColor(c.avgReplyRate) }} className="num">
+          回复 {formatPct(c.avgReplyRate)}
+        </div>
+      </div>
+    ))}
+  </div>
+);
+
+Object.assign(window, { BroadcastModal, BroadcastView, BroadcastAnalysisModal });
