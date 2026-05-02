@@ -715,6 +715,13 @@ def parse_args() -> argparse.Namespace:
         help="Number of chats to read in parallel within each batch (default 1 = serial). 8-16 is a good value.",
     )
     parser.add_argument(
+        "--lite-mode",
+        action="store_true",
+        help="Skip per-chat list_chat_members + iter_messages for chats already in 「机器人群列表」. "
+             "Only fully syncs NEW chats (not yet in Base). Used together with event-driven webhook "
+             "that handles ongoing message/member changes. Reduces daily-sync from ~8h to ~minutes.",
+    )
+    parser.add_argument(
         "--smoke-test",
         action="store_true",
         help="Read-only check: list chats and sample chat members/messages without writing Base records.",
@@ -1380,12 +1387,15 @@ def main() -> int:
     message_field_defs = materialize_field_defs(BASE_MESSAGE_FIELD_DEFS, chat_table_id)
     member_fields = [field["name"] for field in member_field_defs]
     message_fields = [field["name"] for field in message_field_defs]
+    # In lite mode, member rows are maintained by webhook events (user.added /
+    # user.deleted) — do NOT recreate the member table or we wipe what events wrote.
+    member_recreate = args.recreate_tables or (args.refresh_metadata_tables and not args.lite_mode)
     member_table_id = ensure_table_and_fields(
         client,
         base_token,
         args.member_table_name,
         member_field_defs,
-        recreate_tables=args.recreate_tables or args.refresh_metadata_tables,
+        recreate_tables=member_recreate,
     )
     message_table_id = ensure_table_and_fields(
         client,
@@ -1397,6 +1407,11 @@ def main() -> int:
 
     if args.recreate_tables:
         existing_message_ids: set = set()
+    elif args.lite_mode:
+        # Lite mode: existing chats don't fetch messages, so the message-ID dedup
+        # set isn't needed (only new chats get messages, all of which are fresh).
+        existing_message_ids = set()
+        print("Lite mode: 跳过消息ID去重预读（仅对新加入群拉历史消息）", file=sys.stderr)
     else:
         print("正在预读消息表已有 消息ID 用于去重...", file=sys.stderr)
         existing_message_ids = client.list_existing_text_values(
@@ -1413,10 +1428,21 @@ def main() -> int:
 
     def read_one_chat(chat: Dict[str, object]) -> Dict[str, object]:
         chat_id = stringify(chat.get("chat_id"))
+        is_new_chat = chat_id not in existing_chat_record_ids
+
+        # Lite mode: 已存在的 chat 跳过 members + messages 拉取（事件订阅会处理增量）。
+        # 新 chat 仍走完整流程，确保首次入 Base 时数据齐全。
+        skip_heavy = args.lite_mode and not is_new_chat
+
         detail = dict(chat) if args.fast_metadata else client.get_chat_detail(chat_id)
-        members_payload = client.list_chat_members(chat_id)
-        members = list(members_payload.get("items") or [])
-        member_total = int(members_payload.get("member_total") or len(members))
+        if skip_heavy:
+            members: List[Dict[str, object]] = []
+            member_total = int_value(detail.get("user_count"), 0)
+        else:
+            members_payload = client.list_chat_members(chat_id)
+            members = list(members_payload.get("items") or [])
+            member_total = int(members_payload.get("member_total") or len(members))
+
         if args.skip_share_links:
             share_link: Dict[str, object] = {}
         else:
@@ -1435,21 +1461,25 @@ def main() -> int:
             sync_time_text,
             sync_tz,
         )
-        messages = list(
-            client.iter_messages(
-                chat_id,
-                page_size=args.message_page_size,
-                start_time=start_time,
-                end_time=end_time,
-                max_messages=args.max_messages_per_chat,
+        if skip_heavy:
+            messages: List[Dict[str, object]] = []
+        else:
+            messages = list(
+                client.iter_messages(
+                    chat_id,
+                    page_size=args.message_page_size,
+                    start_time=start_time,
+                    end_time=end_time,
+                    max_messages=args.max_messages_per_chat,
+                )
             )
-        )
         return {
             "chat_id": chat_id,
             "chat_name": chat_name,
             "chat_row": chat_row,
             "members": members,
             "messages": messages,
+            "is_new_chat": is_new_chat,
         }
 
     for chat_batch in chunked(chats, batch_size):

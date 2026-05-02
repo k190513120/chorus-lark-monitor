@@ -146,6 +146,9 @@ def _job_daily_sync() -> int:
             "--read-concurrency", "12",
             "--sync-timezone", "Asia/Shanghai",
             "--chat-order", "created_desc",
+            # Lite mode: 已有 chat 跳过 members + messages 拉取（webhook 事件接管）。
+            # 只对新加入的 chat 做完整同步。daily-sync 时间从 ~8h 降到 ~分钟。
+            "--lite-mode",
         ],
         "daily-sync",
     )
@@ -234,11 +237,15 @@ async def lifespan(app: FastAPI):
     global SCHEDULER
     SCHEDULER = _start_scheduler()
     log.info("server v%s up; env_ok=%s", VERSION, _check_required_env())
-    # Warm the dashboard cache asynchronously so the first browser visit
-    # doesn't trigger a 503 / blank dashboard.
     if all(_check_required_env().values()):
+        # Warm the dashboard cache asynchronously so the first browser visit
+        # doesn't trigger a 503 / blank dashboard.
         log.info("[dashboard] kicking off initial cache warm-up...")
         _ensure_dashboard_rebuild_running()
+        # Pre-warm the chat_record_cache so the first webhook event doesn't
+        # block 30-60s waiting for 16k records to load from Lark Base.
+        log.info("[event] kicking off chat-record cache warm-up...")
+        _event_pool.submit(_refresh_chat_record_cache_if_stale)
     try:
         yield
     finally:
