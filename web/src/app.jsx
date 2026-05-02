@@ -1,70 +1,112 @@
-// Root App
+// 顶层 App — 把 design 的 3 视图（DR/告警/总览）和 broadcast tab 串起来。
 
 const { useState, useEffect } = React;
 
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "view": "roster",
+  "density": "regular",
+  "theme": "dark",
+  "aiOn": true,
+  "accent": "blue"
+}/*EDITMODE-END*/;
+
+const ACCENT_HUES = {
+  blue:   { h: 220, h2: 145 },
+  purple: { h: 285, h2: 195 },
+  green:  { h: 165, h2: 220 },
+  amber:  { h: 65,  h2: 200 },
+};
+
 function App() {
-  const groups = AppData.GROUPS || [];
-  const broadcasts = AppData.BROADCASTS || [];
+  const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
 
-  const [activeTab, setActiveTab] = useState(() => localStorage.getItem("cm.activeTab") || "dashboard");
-  const [activeId, setActiveId] = useState(() => {
-    return localStorage.getItem("cm.activeId") || (groups[0] && groups[0].id) || "";
-  });
-  const [broadcastOpen, setBroadcastOpen] = useState(false);
-  const [broadcastPrefill, setBroadcastPrefill] = useState(null);
-
-  const [editMode, setEditMode] = useState(false);
-  const [tweaks, setTweaks] = useState(() => ({ ...window.TWEAK_DEFAULTS }));
-
-  useEffect(() => { window.applyTweaks(tweaks); }, []);
-  useEffect(() => { localStorage.setItem("cm.activeId", activeId); }, [activeId]);
+  // 顶层 tab：监控看板 / 群发消息
+  const [activeTab, setActiveTab] = useState(() =>
+    localStorage.getItem("cm.activeTab") || "dashboard"
+  );
   useEffect(() => { localStorage.setItem("cm.activeTab", activeTab); }, [activeTab]);
 
-  // Edit-mode host protocol
+  // 时钟（用于 TopBar 实时同步显示）
+  const [now, setNow] = useState(new Date());
   useEffect(() => {
-    const onMsg = (e) => {
-      if (!e.data || typeof e.data !== "object") return;
-      if (e.data.type === "__activate_edit_mode") setEditMode(true);
-      if (e.data.type === "__deactivate_edit_mode") setEditMode(false);
-    };
-    window.addEventListener("message", onMsg);
-    window.parent.postMessage({ type: "__edit_mode_available" }, "*");
-    return () => window.removeEventListener("message", onMsg);
+    const id = setInterval(() => setNow(new Date()), 30000);
+    return () => clearInterval(id);
   }, []);
 
-  const activeGroup = groups.find(g => g.id === activeId) || groups[0];
+  // 主题
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", t.theme || "dark");
+  }, [t.theme]);
+
+  // 强调色
+  useEffect(() => {
+    const a = ACCENT_HUES[t.accent] || ACCENT_HUES.blue;
+    document.documentElement.style.setProperty("--accent",   `oklch(0.78 0.14 ${a.h})`);
+    document.documentElement.style.setProperty("--accent-2", `oklch(0.82 0.14 ${a.h2})`);
+  }, [t.accent]);
+
+  // dashboard 内部状态
+  const [drFilter, setDrFilter] = useState("all");
+  const [timeRange, setTimeRange] = useState("today");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [openDr, setOpenDr] = useState(null);
+  const [openGroup, setOpenGroup] = useState(null);
+
+  // broadcast modal 状态
+  const [broadcastOpen, setBroadcastOpen] = useState(false);
+  const [broadcastPrefill, setBroadcastPrefill] = useState(null);
   const openBroadcastWizard = (prefill = null) => {
     setBroadcastPrefill(prefill);
     setBroadcastOpen(true);
   };
-  const switchToBroadcastTab = () => setActiveTab("broadcast");
+
+  const broadcasts = (window.AppData && window.AppData.BROADCASTS) || [];
+  const groups = (window.AppData && window.AppData.GROUPS) || [];
 
   return (
-    <div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
-      <TopBar activeTab={activeTab} onSelectTab={setActiveTab} />
-      <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
+    <div className="app">
+      <div className="shell">
+        <TopBar now={now} activeTab={activeTab} onSelectTab={setActiveTab} />
+
         {activeTab === "dashboard" && (
           <>
-            <GroupList
-              groups={groups}
-              activeId={activeId}
-              onSelect={g => setActiveId(g.id)}
+            <FilterBar
+              view={t.view} setView={(v) => setTweak("view", v)}
+              drFilter={drFilter} setDrFilter={setDrFilter}
+              timeRange={timeRange} setTimeRange={setTimeRange}
+              statusFilter={statusFilter} setStatusFilter={setStatusFilter}
             />
-            <div className="scroll" style={{ flex: 1, overflowY: "auto", background: "var(--bg-sunk)" }}>
-              <div style={{ padding: "18px 22px 0" }}>
-                <StatsOverview D={AppData.DASHBOARD} broadcasts={broadcasts} onAlertOpen={g => setActiveId(g.id)} />
-              </div>
-              <div style={{ padding: "18px 22px 22px" }}>
-                <Card padded={false} style={{ overflow: "hidden", height: "calc(100vh - 360px)", minHeight: 600, display: "flex", flexDirection: "column" }}>
-                  {activeGroup && <DetailPane group={activeGroup} />}
-                </Card>
-              </div>
+            <div className="main">
+              <StatStrip />
+              {t.view === "roster" && (
+                <RosterView
+                  density={t.density}
+                  drFilter={drFilter}
+                  statusFilter={statusFilter}
+                  onOpenDr={setOpenDr}
+                  onOpenGroup={setOpenGroup}
+                />
+              )}
+              {t.view === "alerts" && (
+                <AlertsView
+                  statusFilter={statusFilter}
+                  drFilter={drFilter}
+                  onOpenGroup={setOpenGroup}
+                />
+              )}
+              {t.view === "overview" && (
+                <OverviewView
+                  aiOn={t.aiOn}
+                  onOpenDr={setOpenDr}
+                  onOpenGroup={setOpenGroup}
+                />
+              )}
             </div>
           </>
         )}
 
         {activeTab === "broadcast" && (
-          <div className="scroll" style={{ flex: 1, overflowY: "auto", background: "var(--bg-sunk)" }}>
+          <div className="main broadcast-main">
             <BroadcastView
               broadcasts={broadcasts}
               groupCount={groups.length}
@@ -74,6 +116,37 @@ function App() {
         )}
       </div>
 
+      {/* DR 详情抽屉 */}
+      <Drawer
+        open={!!openDr}
+        onClose={() => setOpenDr(null)}
+        title={openDr?.name}
+        subtitle={openDr ? `DR · ${openDr.activeGroups} 活跃 / ${openDr.totalGroups} 总群` : ""}
+      >
+        {openDr && (
+          <DRDetailContent
+            dr={openDr}
+            aiOn={t.aiOn}
+            onOpenGroup={(g) => { setOpenDr(null); setOpenGroup(g); }}
+          />
+        )}
+      </Drawer>
+
+      {/* 群对话抽屉 */}
+      <Drawer
+        open={!!openGroup}
+        onClose={() => setOpenGroup(null)}
+        title={openGroup?.name}
+        subtitle={
+          openGroup
+            ? `${(MOCK.DRS.find(d => d.id === openGroup.drId) || {}).name || "—"} 负责`
+            : ""
+        }
+      >
+        {openGroup && <GroupConvContent group={openGroup} aiOn={t.aiOn} />}
+      </Drawer>
+
+      {/* 群发向导（modal） */}
       <BroadcastModal
         open={broadcastOpen}
         onClose={() => setBroadcastOpen(false)}
@@ -81,90 +154,42 @@ function App() {
         prefillGroup={broadcastPrefill}
       />
 
-      {editMode && (
-        <TweaksPanel tweaks={tweaks} setTweaks={setTweaks} onClose={() => setEditMode(false)}/>
-      )}
+      {/* Tweaks 面板 */}
+      <TweaksPanel>
+        <TweakSection label="视图" />
+        <TweakRadio label="主视图" value={t.view}
+          options={[
+            { value: "roster",   label: "DR 视角" },
+            { value: "alerts",   label: "告警优先" },
+            { value: "overview", label: "全局总览" },
+          ]}
+          onChange={(v) => setTweak("view", v)} />
+        <TweakRadio label="卡片密度" value={t.density}
+          options={["compact", "regular"]}
+          onChange={(v) => setTweak("density", v)} />
+
+        <TweakSection label="外观" />
+        <TweakRadio label="主题" value={t.theme}
+          options={[
+            { value: "dark",  label: "深色" },
+            { value: "light", label: "浅色" },
+          ]}
+          onChange={(v) => setTweak("theme", v)} />
+        <TweakRadio label="强调色" value={t.accent}
+          options={[
+            { value: "blue",   label: "冷蓝" },
+            { value: "purple", label: "靛紫" },
+            { value: "green",  label: "翠绿" },
+            { value: "amber",  label: "琥珀" },
+          ]}
+          onChange={(v) => setTweak("accent", v)} />
+
+        <TweakSection label="AI 助手" />
+        <TweakToggle label="显示 AI 摘要" value={t.aiOn}
+          onChange={(v) => setTweak("aiOn", v)} />
+      </TweaksPanel>
     </div>
   );
 }
 
-const TopBar = ({ activeTab, onSelectTab }) => {
-  const tabs = [
-    { id: "dashboard", label: "监控看板", real: true },
-    { id: "broadcast", label: "群发消息", real: true },
-    { id: "team", label: "团队", real: false },
-    { id: "settings", label: "设置", real: false },
-  ];
-  return (
-    <header style={{
-      height: 56, padding: "0 22px",
-      borderBottom: "1px solid var(--line)",
-      background: "var(--bg-elev)",
-      display: "flex", alignItems: "center", gap: 16,
-      flexShrink: 0,
-    }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <div style={{
-          width: 30, height: 30, borderRadius: 9,
-          background: "var(--ink)", color: "var(--bg-elev)",
-          display: "grid", placeItems: "center",
-          fontWeight: 600, fontSize: 13,
-          fontFamily: "var(--font-num)",
-        }}>
-          C
-        </div>
-        <div>
-          <div style={{ fontSize: 14, fontWeight: 600, lineHeight: 1.1 }}>Chorus · 群聊管理台</div>
-          <div style={{ fontSize: 11, color: "var(--ink-3)" }}>飞书群消息实时监控</div>
-        </div>
-      </div>
-
-      <nav style={{ display: "flex", gap: 4, marginLeft: 14 }}>
-        {tabs.map((t) => {
-          const active = activeTab === t.id;
-          return (
-            <button
-              key={t.id}
-              onClick={() => t.real && onSelectTab(t.id)}
-              disabled={!t.real}
-              title={t.real ? "" : "敬请期待"}
-              style={{
-                padding: "6px 12px", fontSize: 13, borderRadius: 8,
-                color: active ? "var(--ink)" : "var(--ink-3)",
-                background: active ? "var(--bg-sunk)" : "transparent",
-                fontWeight: active ? 500 : 400,
-                cursor: t.real ? "pointer" : "not-allowed",
-                opacity: t.real ? 1 : 0.5,
-              }}
-            >{t.label}</button>
-          );
-        })}
-      </nav>
-
-      <div style={{ flex: 1 }}/>
-
-      <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "var(--ink-3)" }}>
-        <span style={{
-          display: "inline-flex", alignItems: "center", gap: 5,
-          padding: "4px 8px", borderRadius: 999,
-          background: "var(--sage-soft)", color: "oklch(0.35 0.08 155)",
-        }}>
-          <span style={{
-            width: 6, height: 6, borderRadius: 999, background: "oklch(0.55 0.13 155)",
-            boxShadow: "0 0 0 3px oklch(0.55 0.13 155 / 0.25)",
-          }}/>
-          实时同步中
-        </span>
-      </div>
-
-      <div style={{
-        width: 34, height: 34, borderRadius: 999,
-        background: "oklch(0.82 0.09 45)", color: "oklch(0.32 0.10 45)",
-        display: "grid", placeItems: "center",
-        fontWeight: 600, fontSize: 13,
-      }}>管</div>
-    </header>
-  );
-};
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
