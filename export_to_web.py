@@ -62,11 +62,25 @@ def list_all_records(client: FeishuClient, app_token: str, table_id: str, field_
             params["field_names"] = json.dumps(field_names, ensure_ascii=False)
         if page_token:
             params["page_token"] = page_token
-        data = client.request(
-            "GET",
-            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
-            params=params,
-        )
+        try:
+            data = client.request(
+                "GET",
+                f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+                params=params,
+            )
+        except FeishuAPIError as exc:
+            # Lark Base list endpoint caps at ~50k records per query; once a table
+            # exceeds that we get code=1254103 RecordExceedLimit. Return whatever
+            # we got so the dashboard build keeps going.
+            msg = str(exc)
+            if "1254103" in msg or "RecordExceedLimit" in msg:
+                print(
+                    f"WARN: list_all_records hit RecordExceedLimit on {table_id} "
+                    f"after {len(records)} rows; returning partial.",
+                    file=sys.stderr,
+                )
+                return records
+            raise
         records.extend(data.get("items") or [])
         if not data.get("has_more"):
             return records
@@ -401,6 +415,21 @@ def build_app_data(
                 tenant_counts[tk] += 1
     team_tenant = max(tenant_counts.items(), key=lambda kv: kv[1])[0] if tenant_counts else ""
 
+    # Fallback team detection: if member data is partial/empty (e.g. member-table
+    # list API hit the 50k cap), derive "team" from message senders that appear in
+    # multiple chats. A real DR sends across many groups; a customer typically only
+    # in their own. Threshold: sender seen in ≥ MIN_DR_CHAT_COUNT distinct chats.
+    MIN_DR_CHAT_COUNT = 3
+    sender_chat_set: Dict[str, set] = defaultdict(set)
+    sender_name_hint: Dict[str, str] = {}
+    for c_id, msgs in messages_by_chat.items():
+        for m in msgs:
+            sid = m.get("sender_id")
+            if not sid:
+                continue
+            sender_chat_set[sid].add(c_id)
+    inferred_team_ids: set = {sid for sid, cs in sender_chat_set.items() if len(cs) >= MIN_DR_CHAT_COUNT}
+
     team_speakers: Dict[str, Dict] = {}
     hourly = [0] * 24
 
@@ -432,6 +461,31 @@ def build_app_data(
                 team_members.append(member)
             else:
                 client_members.append(member)
+
+        # Fallback：member 表读不到的群，从 message senders 反推 "team" 成员
+        # （那些跨多个 chat 的发送者）。也把他们的名字索引下来，供 UI 显示。
+        if not team_members and raw_messages:
+            seen_team_ids = set()
+            for m in raw_messages:
+                sid = m.get("sender_id")
+                if not sid or sid in seen_team_ids:
+                    continue
+                if sid not in inferred_team_ids:
+                    continue
+                seen_team_ids.add(sid)
+                # 取消息体里的发送者名字（如果有）— display_messages 还没建好，
+                # 但消息表 sender 信息只有 id；用 id 短哈希做占位。
+                guess_name = sender_name_hint.get(sid) or sid[-6:]
+                member = {
+                    "id": sid,
+                    "name": guess_name,
+                    "company": "Chorus 团队",
+                    "role": "客服",
+                    "side": "team",
+                    "avatar": avatar_for(guess_name),
+                }
+                member_objs.append(member)
+                team_members.append(member)
 
         owner_name = next(
             (m["name"] for m in raw_members if m["id"] == owner_id),
