@@ -651,9 +651,11 @@ def _run_manual_refresh(max_age_days: int) -> None:
             ["refresh", "--max-age-days", str(max_age_days)],
             "manual-bulk-refresh",
         )
-        # 让下次 dashboard 拉取时获取新数据
+        # 让下次 dashboard / 分析 拉取时获取新数据
         _dashboard_cache["data"] = None
         _dashboard_cache["expires_at"] = 0
+        _broadcast_cache["data"] = None
+        _broadcast_cache["expires_at"] = 0
         _manual_refresh_state.update({
             "running": False,
             "ended_at": int(time.time()),
@@ -688,11 +690,35 @@ async def manual_bulk_refresh_status() -> dict:
 
 # ─── /api/broadcast/analysis — 群发数据分析报告 ──────────────────────────────
 
+def _load_broadcasts_only() -> list[dict]:
+    """Load broadcasts directly from Base (skip the heavy dashboard payload build)."""
+    import export_to_web
+    from sync_feishu_groups_to_base import FeishuClient, load_timezone, parse_base_token
+    sync_tz = load_timezone(os.getenv("SYNC_TIMEZONE", "Asia/Shanghai"))
+    base_token = parse_base_token(os.environ["LARK_BASE_URL"])
+    client = FeishuClient(os.environ["LARK_APP_ID"], os.environ["LARK_APP_SECRET"])
+    client.authenticate()
+    return export_to_web.load_broadcasts(client, base_token, sync_tz)
+
+
+_broadcast_cache: dict[str, Any] = {"data": None, "expires_at": 0.0}
+BROADCAST_CACHE_TTL_SEC = 60
+
+
+async def _get_broadcasts_cached() -> list[dict]:
+    now = time.time()
+    if _broadcast_cache["data"] is not None and _broadcast_cache["expires_at"] > now:
+        return _broadcast_cache["data"]
+    data = await asyncio.to_thread(_load_broadcasts_only)
+    _broadcast_cache["data"] = data
+    _broadcast_cache["expires_at"] = now + BROADCAST_CACHE_TTL_SEC
+    return data
+
+
 @app.get("/api/broadcast/analysis")
 async def broadcast_analysis() -> dict:
-    """从 BROADCASTS 数据聚合出可读的分析报告。"""
-    payload = await _get_or_build_dashboard_payload()
-    broadcasts: list[dict] = list(payload.get("BROADCASTS") or [])
+    """从 BROADCASTS 数据聚合出可读的分析报告。直接读 broadcasts 表，不依赖 dashboard。"""
+    broadcasts: list[dict] = list(await _get_broadcasts_cached())
 
     # 全局 KPI
     total_batches = len(broadcasts)
