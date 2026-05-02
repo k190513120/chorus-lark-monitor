@@ -35,7 +35,7 @@ from typing import Any
 from apscheduler.executors.pool import ThreadPoolExecutor as APSThreadPoolExecutor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -67,6 +67,29 @@ _bulk_jobs_lock = threading.Lock()
 _lark_event_log: deque = deque(maxlen=200)
 _lark_event_counts: dict[str, int] = {}
 _lark_persist_counts: dict[str, int] = {}  # 已持久化到 Base 的事件计数
+_lark_dedup_count = 0
+
+
+class _LRUSet:
+    """Thread-safe set of last N keys; returns False on re-seen keys."""
+    def __init__(self, maxsize: int = 10000) -> None:
+        self.maxsize = maxsize
+        self.cache: OrderedDict = OrderedDict()
+        self.lock = threading.Lock()
+
+    def add_if_new(self, key: str) -> bool:
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                return False
+            self.cache[key] = None
+            if len(self.cache) > self.maxsize:
+                self.cache.popitem(last=False)
+            return True
+
+
+# Lark may retry events; dedup by event_id (set in header.event_id).
+_seen_event_ids = _LRUSet(maxsize=10000)
 
 # Background pool for event processing — webhook returns 200 immediately,
 # actual Base writes happen here.
@@ -1115,6 +1138,14 @@ async def lark_events(req: Request) -> dict:
     event_type = header.get("event_type") or "unknown"
     event_id = header.get("event_id") or ""
 
+    # Dedup by event_id (Lark may retry on transient errors)
+    if event_id:
+        global _lark_dedup_count
+        if not _seen_event_ids.add_if_new(event_id):
+            _lark_dedup_count += 1
+            log.info("[lark/events] dedup skip type=%s id=%s", event_type, event_id)
+            return {"code": 0}
+
     _lark_event_counts[event_type] = _lark_event_counts.get(event_type, 0) + 1
     _lark_event_log.append({
         "ts": int(time.time()),
@@ -1137,6 +1168,7 @@ async def lark_events_recent(limit: int = 50) -> dict:
     return {
         "counts": dict(_lark_event_counts),
         "persisted": dict(_lark_persist_counts),
+        "deduped": _lark_dedup_count,
         "chat_record_cache_size": len(_chat_record_cache),
         "recent": list(_lark_event_log)[-limit:],
     }
