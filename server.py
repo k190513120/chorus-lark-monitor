@@ -36,6 +36,7 @@ from apscheduler.executors.pool import ThreadPoolExecutor as APSThreadPoolExecut
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,6 +66,21 @@ _bulk_jobs_lock = threading.Lock()
 # Lark event subscription — recent events ring buffer for debugging.
 _lark_event_log: deque = deque(maxlen=200)
 _lark_event_counts: dict[str, int] = {}
+_lark_persist_counts: dict[str, int] = {}  # 已持久化到 Base 的事件计数
+
+# Background pool for event processing — webhook returns 200 immediately,
+# actual Base writes happen here.
+_event_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lark-event")
+
+# Cached Lark client + Base table ids (lazy-init on first event).
+_lark_state: dict[str, Any] = {"ready": False}
+_lark_state_lock = threading.Lock()
+
+# chat_id → record_id cache (refreshed every 10 min)
+_chat_record_cache: dict[str, str] = {}
+_chat_record_cache_built_at = 0.0
+_chat_record_cache_lock = threading.Lock()
+CHAT_RECORD_CACHE_TTL_SEC = 600
 
 
 def _run_script(module_name: str, argv: list[str], job_name: str) -> int:
@@ -625,8 +641,200 @@ async def bulk_progress_ws(ws: WebSocket, batch_id: str) -> None:
 
 
 # ─── /lark/events Webhook ─────────────────────────────────────────────────────
-# Lark 事件订阅回调入口。Phase 1 实现：URL 验证握手 + 事件日志记录（不持久化）。
-# 后续 phase 加：消息事件 → 写消息表，成员事件 → 改 member 表，bot 加群 → 触发首次 backfill。
+# Lark 事件订阅回调入口。Webhook 必须在 3s 内返回 200，所以实际写 Base 的工作
+# 抛到 _event_pool 后台线程执行。
+
+def _ensure_lark_state() -> dict[str, Any]:
+    """Lazy-init shared FeishuClient + Base table id cache. Thread-safe."""
+    if _lark_state.get("ready"):
+        return _lark_state
+    with _lark_state_lock:
+        if _lark_state.get("ready"):
+            return _lark_state
+        from sync_feishu_groups_to_base import (
+            CHAT_TABLE_NAME,
+            FeishuClient,
+            MEMBER_TABLE_NAME,
+            MESSAGE_TABLE_NAME,
+            parse_base_token,
+        )
+        client = FeishuClient(os.environ["LARK_APP_ID"], os.environ["LARK_APP_SECRET"])
+        client.authenticate()
+        base_token = parse_base_token(os.environ["LARK_BASE_URL"])
+        table_ids: dict[str, str] = {}
+        for t in client.list_tables(base_token):
+            name = t.get("name") or t.get("table_name")
+            if name in (CHAT_TABLE_NAME, MEMBER_TABLE_NAME, MESSAGE_TABLE_NAME):
+                tid = t.get("table_id") or t.get("id")
+                if tid:
+                    table_ids[str(name)] = str(tid)
+        _lark_state.update({
+            "ready": True,
+            "client": client,
+            "base_token": base_token,
+            "table_ids": table_ids,
+        })
+        log.info("[event] lark state initialized; table_ids=%s", table_ids)
+    return _lark_state
+
+
+def _refresh_chat_record_cache_if_stale() -> None:
+    """Rebuild chat_id → record_id map from chat 表 (rate-limited)."""
+    global _chat_record_cache_built_at
+    if time.time() - _chat_record_cache_built_at < CHAT_RECORD_CACHE_TTL_SEC:
+        return
+    with _chat_record_cache_lock:
+        if time.time() - _chat_record_cache_built_at < CHAT_RECORD_CACHE_TTL_SEC:
+            return
+        try:
+            from sync_feishu_groups_to_base import CHAT_TABLE_NAME
+            state = _ensure_lark_state()
+            client = state["client"]
+            chat_table_id = state["table_ids"].get(CHAT_TABLE_NAME)
+            if not chat_table_id:
+                return
+            new_map = client.list_existing_record_ids_v1(
+                state["base_token"], chat_table_id, "群ID"
+            )
+            _chat_record_cache.clear()
+            _chat_record_cache.update(new_map)
+            _chat_record_cache_built_at = time.time()
+            log.info("[event] chat-record cache rebuilt: %d entries", len(_chat_record_cache))
+        except Exception:
+            log.exception("[event] chat-record cache refresh failed")
+
+
+def _bump_persist_count(label: str) -> None:
+    _lark_persist_counts[label] = _lark_persist_counts.get(label, 0) + 1
+
+
+def _process_message_event(body: dict) -> None:
+    """im.message.receive_v1 → append 1 row to 「机器人群消息记录」."""
+    try:
+        from sync_feishu_groups_to_base import (
+            BASE_MESSAGE_FIELD_DEFS,
+            CHAT_TABLE_NAME,
+            MESSAGE_TABLE_NAME,
+            build_message_row,
+            materialize_field_defs,
+        )
+        event = body.get("event") or {}
+        msg = event.get("message") or {}
+        sender = event.get("sender") or {}
+        chat_id = msg.get("chat_id") or ""
+        message_id = msg.get("message_id") or ""
+        if not chat_id or not message_id:
+            log.warning("[event/message] missing chat_id/message_id; skip")
+            return
+
+        state = _ensure_lark_state()
+        msg_table_id = state["table_ids"].get(MESSAGE_TABLE_NAME)
+        chat_table_id = state["table_ids"].get(CHAT_TABLE_NAME)
+        if not msg_table_id or not chat_table_id:
+            log.warning("[event/message] tables not cached; skip")
+            return
+
+        _refresh_chat_record_cache_if_stale()
+        chat_record_id = _chat_record_cache.get(chat_id) or ""
+
+        # Convert webhook event → iter_messages-shaped dict (build_message_row's input)
+        synthetic_msg = {
+            "message_id": message_id,
+            "msg_type": msg.get("message_type"),
+            "create_time": msg.get("create_time"),
+            "update_time": msg.get("update_time"),
+            "chat_id": chat_id,
+            "body": {"content": msg.get("content")},
+            "sender": {
+                "id": (sender.get("sender_id") or {}).get("open_id"),
+                "id_type": "open_id",
+                "sender_type": sender.get("sender_type"),
+                "tenant_key": sender.get("tenant_key"),
+            },
+            "deleted": False,
+            "updated": False,
+            "thread_id": msg.get("thread_id"),
+            "root_id": msg.get("root_id"),
+            "parent_id": msg.get("parent_id"),
+        }
+
+        sync_run_id = "event-" + datetime.now(SYNC_TZ).strftime("%Y%m%d%H%M%S")
+        row = build_message_row(synthetic_msg, "", chat_record_id, sync_run_id, SYNC_TZ)
+        message_field_defs = materialize_field_defs(BASE_MESSAGE_FIELD_DEFS, chat_table_id)
+        message_fields = [f["name"] for f in message_field_defs]
+        state["client"].batch_create_records(
+            state["base_token"], msg_table_id, message_fields, [row]
+        )
+        _bump_persist_count("message")
+        log.info("[event/message] persisted msg=%s chat=%s", message_id, chat_id)
+    except Exception:
+        log.exception("[event/message] failed")
+
+
+def _process_member_added_event(body: dict) -> None:
+    """im.chat.member.user.added_v1 → append member rows to 「机器人群成员记录」."""
+    try:
+        from sync_feishu_groups_to_base import (
+            BASE_MEMBER_FIELD_DEFS,
+            CHAT_TABLE_NAME,
+            MEMBER_TABLE_NAME,
+            build_member_rows,
+            materialize_field_defs,
+        )
+        event = body.get("event") or {}
+        chat_id = event.get("chat_id") or ""
+        chat_name = event.get("name") or ""
+        users = event.get("users") or []
+        if not chat_id or not users:
+            log.warning("[event/member-add] missing chat_id/users; skip")
+            return
+
+        state = _ensure_lark_state()
+        member_table_id = state["table_ids"].get(MEMBER_TABLE_NAME)
+        chat_table_id = state["table_ids"].get(CHAT_TABLE_NAME)
+        if not member_table_id or not chat_table_id:
+            log.warning("[event/member-add] tables not cached; skip")
+            return
+
+        _refresh_chat_record_cache_if_stale()
+        chat_record_id = _chat_record_cache.get(chat_id) or ""
+
+        # Convert event users → list_chat_members-shaped dicts
+        members = []
+        for u in users:
+            uid = u.get("user_id") or {}
+            members.append({
+                "member_id": uid.get("open_id") or "",
+                "member_id_type": "open_id",
+                "name": u.get("name") or "",
+                "tenant_key": u.get("tenant_key") or "",
+            })
+
+        sync_run_id = "event-" + datetime.now(SYNC_TZ).strftime("%Y%m%d%H%M%S")
+        rows = build_member_rows(chat_id, chat_name, chat_record_id, members, sync_run_id)
+        if not rows:
+            return
+        member_field_defs = materialize_field_defs(BASE_MEMBER_FIELD_DEFS, chat_table_id)
+        member_fields = [f["name"] for f in member_field_defs]
+        state["client"].batch_create_records(
+            state["base_token"], member_table_id, member_fields, rows
+        )
+        _bump_persist_count("member-add")
+        log.info("[event/member-add] +%d users in chat %s", len(rows), chat_id)
+    except Exception:
+        log.exception("[event/member-add] failed")
+
+
+# Map event_type → handler. Events not in this map are logged but not persisted.
+EVENT_HANDLERS = {
+    "im.message.receive_v1": _process_message_event,
+    "im.chat.member.user.added_v1": _process_member_added_event,
+    # Phase 2b TODO:
+    #   im.chat.member.user.deleted_v1 → delete member row
+    #   im.chat.member.bot.added_v1    → write chat row + queue backfill
+    #   im.chat.disbanded_v1           → mark chat dissolved
+}
+
 
 @app.post("/lark/events")
 async def lark_events(req: Request) -> dict:
@@ -637,13 +845,13 @@ async def lark_events(req: Request) -> dict:
         log.warning("[lark/events] non-JSON body: %r", raw[:200])
         return {"code": 0}
 
-    # 1) URL 验证握手（首次填 webhook 时飞书会发这个）
+    # 1) URL 验证握手
     if body.get("type") == "url_verification":
         challenge = body.get("challenge")
         log.info("[lark/events] url_verification challenge=%s", challenge)
         return {"challenge": challenge}
 
-    # 2) 真实事件（schema 2.0）
+    # 2) schema 2.0 事件
     header = body.get("header") or {}
     event_type = header.get("event_type") or "unknown"
     event_id = header.get("event_id") or ""
@@ -655,17 +863,22 @@ async def lark_events(req: Request) -> dict:
         "event_type": event_type,
         "preview": json.dumps(body.get("event") or {}, ensure_ascii=False)[:300],
     })
-
-    # 仅打印简要日志，避免刷爆
     log.info("[lark/events] type=%s id=%s", event_type, event_id)
+
+    # 3) 派发到后台线程持久化（webhook 必须 3s 内返回）
+    handler = EVENT_HANDLERS.get(event_type)
+    if handler:
+        _event_pool.submit(handler, body)
+
     return {"code": 0}
 
 
 @app.get("/lark/events/recent")
 async def lark_events_recent(limit: int = 50) -> dict:
-    """方便人手查最近收到的事件（不暴露密钥/token，仅 event_type + 简要 preview）。"""
     return {
         "counts": dict(_lark_event_counts),
+        "persisted": dict(_lark_persist_counts),
+        "chat_record_cache_size": len(_chat_record_cache),
         "recent": list(_lark_event_log)[-limit:],
     }
 
