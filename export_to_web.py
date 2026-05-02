@@ -419,13 +419,22 @@ def build_app_data(
     # list API hit the 50k cap), derive "team" from message senders that appear in
     # multiple chats. A real DR sends across many groups; a customer typically only
     # in their own. Threshold: sender seen in ≥ MIN_DR_CHAT_COUNT distinct chats.
+    # Known operator open_ids → display name. Extend this map as new DRs onboard.
+    KNOWN_DR_NAMES: Dict[str, str] = {
+        "ou_6db3209e799b66dd96ba39b3837d025a": "杜小龙",
+        "ou_a6a3ba3e754f23f83b7122f87886a98c": "柯蓝",
+        # add 葛畅、王登朋 等：从飞书后台或事件 operator_id 拿到 open_id 后填进来
+    }
     MIN_DR_CHAT_COUNT = 3
     sender_chat_set: Dict[str, set] = defaultdict(set)
-    sender_name_hint: Dict[str, str] = {}
+    sender_name_hint: Dict[str, str] = dict(KNOWN_DR_NAMES)
     for c_id, msgs in messages_by_chat.items():
         for m in msgs:
-            sid = m.get("sender_id")
+            sid = m.get("sender_id") or ""
             if not sid:
+                continue
+            # 排除 app/bot id（cli_xxx 开头），只算真人 user (ou_xxx)
+            if not sid.startswith("ou_"):
                 continue
             sender_chat_set[sid].add(c_id)
     inferred_team_ids: set = {sid for sid, cs in sender_chat_set.items() if len(cs) >= MIN_DR_CHAT_COUNT}
@@ -475,7 +484,7 @@ def build_app_data(
                 seen_team_ids.add(sid)
                 # 取消息体里的发送者名字（如果有）— display_messages 还没建好，
                 # 但消息表 sender 信息只有 id；用 id 短哈希做占位。
-                guess_name = sender_name_hint.get(sid) or sid[-6:]
+                guess_name = sender_name_hint.get(sid) or KNOWN_DR_NAMES.get(sid) or sid[-6:]
                 member = {
                     "id": sid,
                     "name": guess_name,
@@ -521,7 +530,14 @@ def build_app_data(
             side = "team" if any(mem["id"] == sender_id and mem["side"] == "team" for mem in member_objs) else "client"
             if side == "team":
                 last_team_reply_time = max(last_team_reply_time, time_ms)
-                team_speakers.setdefault(sender_id, {"id": sender_id, "name": next((mem["name"] for mem in member_objs if mem["id"] == sender_id), "团队成员"), "color": avatar_for(sender_id)["ring"], "msgs": 0})
+                # 取名字优先级：member 表 > KNOWN_DR_NAMES 已配置的 > open_id 末 6 位
+                fallback_name = KNOWN_DR_NAMES.get(sender_id) or (sender_id[-6:] if sender_id else "团队成员")
+                team_speakers.setdefault(sender_id, {
+                    "id": sender_id,
+                    "name": next((mem["name"] for mem in member_objs if mem["id"] == sender_id), fallback_name),
+                    "color": avatar_for(sender_id)["ring"],
+                    "msgs": 0,
+                })
                 team_speakers[sender_id]["msgs"] += 1
             display_messages.append({
                 "id": m["id"] or f"msg-{idx}-{len(display_messages)}",
