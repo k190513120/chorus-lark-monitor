@@ -35,7 +35,9 @@ from typing import Any
 from apscheduler.executors.pool import ThreadPoolExecutor as APSThreadPoolExecutor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from collections import deque
+
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -59,6 +61,10 @@ DASHBOARD_TTL_SEC = 60
 # In-memory bulk-send job tracker. Lost on container restart, fine for short-lived jobs.
 _bulk_jobs: dict[str, dict[str, Any]] = {}
 _bulk_jobs_lock = threading.Lock()
+
+# Lark event subscription — recent events ring buffer for debugging.
+_lark_event_log: deque = deque(maxlen=200)
+_lark_event_counts: dict[str, int] = {}
 
 
 def _run_script(module_name: str, argv: list[str], job_name: str) -> int:
@@ -616,6 +622,52 @@ async def bulk_progress_ws(ws: WebSocket, batch_id: str) -> None:
                 job["subscribers"].remove(queue)
             except ValueError:
                 pass
+
+
+# ─── /lark/events Webhook ─────────────────────────────────────────────────────
+# Lark 事件订阅回调入口。Phase 1 实现：URL 验证握手 + 事件日志记录（不持久化）。
+# 后续 phase 加：消息事件 → 写消息表，成员事件 → 改 member 表，bot 加群 → 触发首次 backfill。
+
+@app.post("/lark/events")
+async def lark_events(req: Request) -> dict:
+    try:
+        body = await req.json()
+    except Exception:
+        raw = await req.body()
+        log.warning("[lark/events] non-JSON body: %r", raw[:200])
+        return {"code": 0}
+
+    # 1) URL 验证握手（首次填 webhook 时飞书会发这个）
+    if body.get("type") == "url_verification":
+        challenge = body.get("challenge")
+        log.info("[lark/events] url_verification challenge=%s", challenge)
+        return {"challenge": challenge}
+
+    # 2) 真实事件（schema 2.0）
+    header = body.get("header") or {}
+    event_type = header.get("event_type") or "unknown"
+    event_id = header.get("event_id") or ""
+
+    _lark_event_counts[event_type] = _lark_event_counts.get(event_type, 0) + 1
+    _lark_event_log.append({
+        "ts": int(time.time()),
+        "event_id": event_id,
+        "event_type": event_type,
+        "preview": json.dumps(body.get("event") or {}, ensure_ascii=False)[:300],
+    })
+
+    # 仅打印简要日志，避免刷爆
+    log.info("[lark/events] type=%s id=%s", event_type, event_id)
+    return {"code": 0}
+
+
+@app.get("/lark/events/recent")
+async def lark_events_recent(limit: int = 50) -> dict:
+    """方便人手查最近收到的事件（不暴露密钥/token，仅 event_type + 简要 preview）。"""
+    return {
+        "counts": dict(_lark_event_counts),
+        "recent": list(_lark_event_log)[-limit:],
+    }
 
 
 # ─── 静态前端 ─────────────────────────────────────────────────────────────────
