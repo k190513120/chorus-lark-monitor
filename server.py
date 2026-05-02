@@ -825,14 +825,264 @@ def _process_member_added_event(body: dict) -> None:
         log.exception("[event/member-add] failed")
 
 
+def _extract_cell_text(cell: object) -> str:
+    if not cell:
+        return ""
+    if isinstance(cell, str):
+        return cell
+    if isinstance(cell, list) and cell:
+        seg = cell[0]
+        if isinstance(seg, dict):
+            return str(seg.get("text") or seg.get("value") or "")
+        return str(seg)
+    if isinstance(cell, dict):
+        return str(cell.get("text") or cell.get("value") or "")
+    return str(cell)
+
+
+def _process_member_deleted_event(body: dict) -> None:
+    """im.chat.member.user.deleted_v1 → delete matching member rows."""
+    try:
+        from sync_feishu_groups_to_base import MEMBER_TABLE_NAME
+        event = body.get("event") or {}
+        chat_id = event.get("chat_id") or ""
+        users = event.get("users") or []
+        if not chat_id or not users:
+            return
+        target_open_ids = {
+            (u.get("user_id") or {}).get("open_id") for u in users
+        }
+        target_open_ids.discard(None)
+        target_open_ids.discard("")
+        if not target_open_ids:
+            return
+
+        state = _ensure_lark_state()
+        member_table_id = state["table_ids"].get(MEMBER_TABLE_NAME)
+        if not member_table_id:
+            return
+        client = state["client"]
+        base_token = state["base_token"]
+
+        # search by 群ID, then filter member open_id client-side
+        search_url = f"/open-apis/bitable/v1/apps/{base_token}/tables/{member_table_id}/records/search"
+        record_ids: list[str] = []
+        page_token = None
+        while True:
+            payload = {
+                "field_names": ["成员ID"],
+                "filter": {
+                    "conjunction": "and",
+                    "conditions": [{"field_name": "群ID", "operator": "is", "value": [chat_id]}],
+                },
+                "page_size": 200,
+            }
+            params = {"page_size": 200}
+            if page_token:
+                params["page_token"] = page_token
+            data = client.request("POST", search_url, params=params, data=payload)
+            for it in (data.get("items") or []):
+                fields = it.get("fields") or {}
+                mid = _extract_cell_text(fields.get("成员ID"))
+                if mid in target_open_ids:
+                    record_ids.append(str(it.get("record_id") or ""))
+            if not data.get("has_more"):
+                break
+            page_token = data.get("page_token")
+            if not page_token:
+                break
+
+        record_ids = [rid for rid in record_ids if rid]
+        if record_ids:
+            client.batch_delete_records_v1(base_token, member_table_id, record_ids)
+            log.info("[event/member-del] -%d rows in chat %s", len(record_ids), chat_id)
+            _bump_persist_count("member-del")
+        else:
+            log.info("[event/member-del] no matching rows for chat %s users=%s", chat_id, list(target_open_ids))
+    except Exception:
+        log.exception("[event/member-del] failed")
+
+
+def _process_message_recalled_event(body: dict) -> None:
+    """im.message.recalled_v1 → flip 是否已删除 to 'true' on the matching row."""
+    try:
+        from sync_feishu_groups_to_base import MESSAGE_TABLE_NAME
+        event = body.get("event") or {}
+        msg_id = event.get("message_id") or ""
+        if not msg_id:
+            return
+        state = _ensure_lark_state()
+        msg_table_id = state["table_ids"].get(MESSAGE_TABLE_NAME)
+        if not msg_table_id:
+            return
+        client = state["client"]
+        base_token = state["base_token"]
+
+        search_url = f"/open-apis/bitable/v1/apps/{base_token}/tables/{msg_table_id}/records/search"
+        payload = {
+            "field_names": ["消息ID"],
+            "filter": {
+                "conjunction": "and",
+                "conditions": [{"field_name": "消息ID", "operator": "is", "value": [msg_id]}],
+            },
+            "page_size": 5,
+        }
+        data = client.request("POST", search_url, data=payload)
+        items = data.get("items") or []
+        if not items:
+            log.info("[event/recall] msg %s not in Base, skip", msg_id)
+            return
+
+        record_ids = [str(it.get("record_id") or "") for it in items if it.get("record_id")]
+        if not record_ids:
+            return
+        rows = [["true"] for _ in record_ids]
+        client.batch_update_records_v1(base_token, msg_table_id, ["是否已删除"], record_ids, rows)
+        log.info("[event/recall] marked msg %s deleted (%d rows)", msg_id, len(record_ids))
+        _bump_persist_count("message-recall")
+    except Exception:
+        log.exception("[event/recall] failed")
+
+
+def _process_chat_disbanded_event(body: dict) -> None:
+    """im.chat.disbanded_v1 → set 群状态 = 'dissolved' on chat row."""
+    try:
+        from sync_feishu_groups_to_base import CHAT_TABLE_NAME
+        event = body.get("event") or {}
+        chat_id = event.get("chat_id") or ""
+        if not chat_id:
+            return
+        state = _ensure_lark_state()
+        chat_table_id = state["table_ids"].get(CHAT_TABLE_NAME)
+        if not chat_table_id:
+            return
+        _refresh_chat_record_cache_if_stale()
+        record_id = _chat_record_cache.get(chat_id)
+        if not record_id:
+            log.info("[event/disbanded] chat %s not in Base, skip", chat_id)
+            return
+        client = state["client"]
+        client.batch_update_records_v1(
+            state["base_token"], chat_table_id, ["群状态"], [record_id], [["dissolved"]]
+        )
+        # Drop from cache so future lookups don't return a dissolved record_id silently
+        _chat_record_cache.pop(chat_id, None)
+        log.info("[event/disbanded] marked chat %s dissolved", chat_id)
+        _bump_persist_count("chat-disbanded")
+    except Exception:
+        log.exception("[event/disbanded] failed")
+
+
+def _process_bot_added_event(body: dict) -> None:
+    """im.chat.member.bot.added_v1 → upsert chat row + write member rows + 24h message backfill."""
+    try:
+        from sync_feishu_groups_to_base import (
+            BASE_MEMBER_FIELD_DEFS,
+            BASE_MESSAGE_FIELD_DEFS,
+            CHAT_FIELDS,
+            CHAT_TABLE_NAME,
+            MEMBER_TABLE_NAME,
+            MESSAGE_TABLE_NAME,
+            build_chat_row,
+            build_member_rows,
+            build_message_row,
+            materialize_field_defs,
+        )
+        event = body.get("event") or {}
+        chat_id = event.get("chat_id") or ""
+        chat_name = event.get("name") or ""
+        external = event.get("external")
+        if not chat_id:
+            return
+
+        state = _ensure_lark_state()
+        client = state["client"]
+        base_token = state["base_token"]
+        chat_table_id = state["table_ids"].get(CHAT_TABLE_NAME)
+        if not chat_table_id:
+            return
+
+        # 1) chat detail (best-effort; bot may not yet have full perms)
+        try:
+            detail = client.get_chat_detail(chat_id)
+        except Exception:
+            detail = {"chat_id": chat_id, "name": chat_name, "external": external}
+
+        # 2) members (best-effort)
+        try:
+            members_payload = client.list_chat_members(chat_id)
+            members = list(members_payload.get("items") or [])
+            member_total = int(members_payload.get("member_total") or len(members))
+        except Exception:
+            members = []
+            member_total = 0
+
+        # 3) upsert chat row
+        sync_run_id = "event-bot-added-" + datetime.now(SYNC_TZ).strftime("%Y%m%d%H%M%S")
+        sync_time_text = datetime.now(SYNC_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        chat_row = build_chat_row(
+            {"chat_id": chat_id, "name": chat_name, "external": external},
+            detail, {}, members, member_total,
+            sync_run_id, sync_time_text, SYNC_TZ,
+        )
+        existing_map = client.list_existing_record_ids_v1(base_token, chat_table_id, "群ID")
+        existing_rid = existing_map.get(chat_id)
+        if existing_rid:
+            client.batch_update_records_v1(base_token, chat_table_id, CHAT_FIELDS, [existing_rid], [chat_row])
+            chat_record_id = existing_rid
+        else:
+            result = client.batch_create_records(base_token, chat_table_id, CHAT_FIELDS, [chat_row])
+            new_ids = result.get("record_id_list") or []
+            chat_record_id = str(new_ids[0]) if new_ids else ""
+        if chat_record_id:
+            _chat_record_cache[chat_id] = chat_record_id
+
+        # 4) member rows
+        if members and chat_record_id:
+            member_table_id = state["table_ids"].get(MEMBER_TABLE_NAME)
+            if member_table_id:
+                mfd = materialize_field_defs(BASE_MEMBER_FIELD_DEFS, chat_table_id)
+                m_fields = [f["name"] for f in mfd]
+                m_rows = build_member_rows(chat_id, chat_name, chat_record_id, members, sync_run_id)
+                if m_rows:
+                    client.batch_create_records(base_token, member_table_id, m_fields, m_rows)
+
+        # 5) recent 24h messages backfill (best-effort; capped to 200 to keep handler bounded)
+        msg_count = 0
+        msg_table_id = state["table_ids"].get(MESSAGE_TABLE_NAME)
+        if msg_table_id and chat_record_id:
+            now_ts = int(time.time())
+            start_ts = now_ts - 86400
+            try:
+                messages = list(client.iter_messages(
+                    chat_id, page_size=50, start_time=start_ts, end_time=now_ts, max_messages=200,
+                ))
+            except Exception:
+                messages = []
+            if messages:
+                msfd = materialize_field_defs(BASE_MESSAGE_FIELD_DEFS, chat_table_id)
+                msg_fields = [f["name"] for f in msfd]
+                rows = [build_message_row(m, chat_name, chat_record_id, sync_run_id, SYNC_TZ) for m in messages]
+                client.batch_create_records(base_token, msg_table_id, msg_fields, rows)
+                msg_count = len(rows)
+
+        log.info(
+            "[event/bot-added] chat=%s name=%s members=%d msgs=%d",
+            chat_id, chat_name, len(members), msg_count,
+        )
+        _bump_persist_count("bot-added")
+    except Exception:
+        log.exception("[event/bot-added] failed")
+
+
 # Map event_type → handler. Events not in this map are logged but not persisted.
 EVENT_HANDLERS = {
-    "im.message.receive_v1": _process_message_event,
-    "im.chat.member.user.added_v1": _process_member_added_event,
-    # Phase 2b TODO:
-    #   im.chat.member.user.deleted_v1 → delete member row
-    #   im.chat.member.bot.added_v1    → write chat row + queue backfill
-    #   im.chat.disbanded_v1           → mark chat dissolved
+    "im.message.receive_v1":          _process_message_event,
+    "im.message.recalled_v1":         _process_message_recalled_event,
+    "im.chat.member.user.added_v1":   _process_member_added_event,
+    "im.chat.member.user.deleted_v1": _process_member_deleted_event,
+    "im.chat.member.bot.added_v1":    _process_bot_added_event,
+    "im.chat.disbanded_v1":           _process_chat_disbanded_event,
 }
 
 
