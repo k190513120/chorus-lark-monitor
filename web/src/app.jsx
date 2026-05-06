@@ -192,4 +192,46 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+// Error boundary —— 不再黑屏，把异常信息直接画在页面上方便定位。
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { err: null, info: null }; }
+  static getDerivedStateFromError(err) { return { err }; }
+  componentDidCatch(err, info) {
+    this.setState({ info });
+    console.error("[ErrorBoundary]", err, info);
+  }
+  render() {
+    if (!this.state.err) return this.props.children;
+    return (
+      <div style={{
+        padding: 24, margin: 24,
+        background: "oklch(0.32 0.08 25 / 0.5)",
+        border: "1px solid oklch(0.68 0.19 25)",
+        borderRadius: 10,
+        color: "#fff",
+        fontFamily: "ui-monospace, monospace",
+        fontSize: 12,
+        whiteSpace: "pre-wrap",
+        lineHeight: 1.5,
+      }}>
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 12 }}>页面渲染出错</div>
+        <div style={{ marginBottom: 12 }}>{String(this.state.err && this.state.err.message)}</div>
+        <details>
+          <summary style={{ cursor: "pointer", marginBottom: 8 }}>stack</summary>
+          <pre style={{ margin: 0, fontSize: 11, opacity: 0.85 }}>{this.state.err && this.state.err.stack}</pre>
+          {this.state.info && (
+            <pre style={{ margin: "8px 0 0", fontSize: 11, opacity: 0.7 }}>{this.state.info.componentStack}</pre>
+          )}
+        </details>
+        <div style={{ marginTop: 16, fontSize: 11, opacity: 0.7 }}>
+          MOCK.DRS: {window.MOCK?.DRS?.length ?? "?"} · MOCK.GROUPS: {window.MOCK?.GROUPS?.length ?? "?"} ·
+          AppData.GROUPS: {window.AppData?.GROUPS?.length ?? "?"}
+        </div>
+      </div>
+    );
+  }
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <ErrorBoundary><App /></ErrorBoundary>
+);
