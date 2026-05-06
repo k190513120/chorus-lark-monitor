@@ -466,7 +466,7 @@ const PickGroups = ({
               }}>
                 {picked && <Icon name="check" size={11} color="white" strokeWidth={3}/>}
               </div>
-              <Avatar avatar={g.avatar} size={30}/>
+              <UiAvatar avatar={g.avatar} size={30}/>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 13, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {g.name}
@@ -509,7 +509,7 @@ const ComposeMessage = ({ text, setText, scheduled, setScheduled, scheduleTime, 
         <div style={{ display: "flex", gap: -6 }}>
           {pickedGroups.slice(0, 6).map((g, i) => (
             <div key={g.id} style={{ marginLeft: i === 0 ? 0 : -8 }}>
-              <Avatar avatar={g.avatar} size={24} ring/>
+              <UiAvatar avatar={g.avatar} size={24} ring/>
             </div>
           ))}
         </div>
@@ -679,7 +679,7 @@ const SendProgress = ({ pickedGroups, progress, text, sent, scheduled, scheduleT
               transition: "opacity 200ms",
             }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                <Avatar avatar={g.avatar} size={22}/>
+                <UiAvatar avatar={g.avatar} size={22}/>
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{g.name}</span>
               </div>
               <div>

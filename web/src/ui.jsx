@@ -1,17 +1,18 @@
 // Shared UI atoms
 
-const Avatar = ({ avatar, size = 36, ring = false, style }) => {
+const UiAvatar = ({ avatar, size = 36, ring = false, style }) => {
+  const safeAvatar = avatar || avatarFor("?");
   const s = {
     width: size, height: size, borderRadius: size * 0.32,
-    background: avatar.bg, color: avatar.fg,
+    background: safeAvatar.bg, color: safeAvatar.fg,
     display: "grid", placeItems: "center",
     fontSize: size * 0.45, fontWeight: 600,
     flexShrink: 0,
-    boxShadow: ring ? `0 0 0 2px var(--bg-elev), 0 0 0 3.5px ${avatar.ring}` : "none",
+    boxShadow: ring ? `0 0 0 2px var(--bg-elev), 0 0 0 3.5px ${safeAvatar.ring}` : "none",
     fontFamily: "var(--font-cn)",
     ...style,
   };
-  return <div style={s}>{avatar.initial}</div>;
+  return <div style={s}>{safeAvatar.initial}</div>;
 };
 
 const Pill = ({ children, tone = "neutral", style, icon }) => {
@@ -142,7 +143,7 @@ const Progress = ({ value, total, color = "var(--accent)", height = 6, showLabel
 };
 
 // sparkline
-const Sparkline = ({ values, color = "var(--accent)", height = 28, width = 80, fill = true }) => {
+const UiSparkline = ({ values, color = "var(--accent)", height = 28, width = 80, fill = true }) => {
   if (!values || !values.length) return null;
   const max = Math.max(...values);
   const min = Math.min(...values);
@@ -183,4 +184,4 @@ const Tip = ({ text, children }) => {
   );
 };
 
-Object.assign(window, { Avatar, Pill, Btn, Card, Progress, Sparkline, Tip });
+Object.assign(window, { UiAvatar, Pill, Btn, Card, Progress, UiSparkline, Tip });
