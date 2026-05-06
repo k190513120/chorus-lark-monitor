@@ -365,6 +365,7 @@ def _build_dashboard_payload() -> dict:
         sync_tz,
         max_messages_per_group,
         broadcasts=broadcasts,
+        client=client,  # let build_app_data live-fetch DR names from per-chat members
     )
     payload["_meta"] = {
         "generated_at": int(time.time()),

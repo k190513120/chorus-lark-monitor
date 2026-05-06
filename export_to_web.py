@@ -7,7 +7,7 @@ import json
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, tzinfo
 from typing import Dict, List, Optional
 
@@ -25,6 +25,7 @@ from sync_feishu_groups_to_base import (
 CLIENT_SIDE_HUE_START = 15
 DEFAULT_MAX_GROUPS = 0
 DEFAULT_MAX_MESSAGES_PER_GROUP = 0
+MIN_DR_CHAT_COUNT = 3
 
 BULK_TASK_TABLE_NAME = "群发任务记录"
 BROADCASTS_DASHBOARD_LIMIT = 10  # 看板上最多显示几条最近群发任务
@@ -116,6 +117,83 @@ def parse_int(value: object, default: int = 0) -> int:
         return int(float(text))
     except (TypeError, ValueError):
         return default
+
+
+def is_usable_member_name(member_id: str, member_name: str) -> bool:
+    return (
+        member_id.startswith("ou_")
+        and bool(member_name)
+        and member_name != "未知成员"
+        and not member_name.startswith(("ou_", "oc_", "cli_"))
+    )
+
+
+def collect_member_name_hints(members_by_chat: Dict[str, List[Dict]]) -> Dict[str, str]:
+    member_name_votes: Dict[str, Counter] = defaultdict(Counter)
+    for members in members_by_chat.values():
+        for m in members:
+            member_id = m.get("id") or ""
+            member_name = (m.get("name") or "").strip()
+            if is_usable_member_name(member_id, member_name):
+                member_name_votes[member_id][member_name] += 1
+    return {
+        member_id: votes.most_common(1)[0][0]
+        for member_id, votes in member_name_votes.items()
+        if votes
+    }
+
+
+def infer_sender_chat_set(messages_by_chat: Dict[str, List[Dict]]) -> Dict[str, set]:
+    sender_chat_set: Dict[str, set] = defaultdict(set)
+    for c_id, msgs in messages_by_chat.items():
+        for m in msgs:
+            sid = m.get("sender_id") or ""
+            if sid.startswith("ou_"):
+                sender_chat_set[sid].add(c_id)
+    return sender_chat_set
+
+
+def load_missing_sender_name_hints(
+    client: FeishuClient,
+    sender_chat_set: Dict[str, set],
+    known_name_hints: Dict[str, str],
+    *,
+    min_chat_count: int = MIN_DR_CHAT_COUNT,
+    max_senders: int = 25,
+    max_chats_per_sender: int = 5,
+) -> Dict[str, str]:
+    missing_sender_ids = [
+        sid
+        for sid, chat_ids in sorted(sender_chat_set.items(), key=lambda kv: len(kv[1]), reverse=True)
+        if len(chat_ids) >= min_chat_count and sid not in known_name_hints
+    ][:max_senders]
+    if not missing_sender_ids:
+        return {}
+
+    missing = set(missing_sender_ids)
+    hints: Dict[str, str] = {}
+    member_cache_by_chat: Dict[str, List[Dict[str, object]]] = {}
+
+    for sender_id in missing_sender_ids:
+        for chat_id in list(sender_chat_set.get(sender_id) or [])[:max_chats_per_sender]:
+            if chat_id not in member_cache_by_chat:
+                try:
+                    payload = client.list_chat_members(chat_id)
+                    member_cache_by_chat[chat_id] = list(payload.get("items") or [])
+                except Exception as exc:  # noqa: BLE001
+                    print(f"WARN: failed to lookup member names in {chat_id}: {exc}", file=sys.stderr)
+                    member_cache_by_chat[chat_id] = []
+            for member in member_cache_by_chat[chat_id]:
+                member_id = extract_text(member.get("member_id"))
+                member_name = extract_text(member.get("name"))
+                if member_id in missing and is_usable_member_name(member_id, member_name):
+                    hints[member_id] = member_name
+            if sender_id in hints:
+                break
+
+    if hints:
+        print(f"  enriched DR names from live chat members: {len(hints)}", file=sys.stderr)
+    return hints
 
 
 def load_broadcasts(client: FeishuClient, base_token: str, sync_tz: tzinfo) -> List[Dict]:
@@ -401,6 +479,7 @@ def build_app_data(
     sync_tz: tzinfo,
     max_messages_per_group: int,
     broadcasts: Optional[List[Dict]] = None,
+    client: Optional[FeishuClient] = None,
 ) -> Dict:
     now_ms = int(datetime.now(sync_tz).timestamp() * 1000)
     today_start_ms = int(datetime.now(sync_tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
@@ -415,19 +494,38 @@ def build_app_data(
                 tenant_counts[tk] += 1
     team_tenant = max(tenant_counts.items(), key=lambda kv: kv[1])[0] if tenant_counts else ""
 
+    member_name_votes: Dict[str, Counter] = defaultdict(Counter)
+    for members in members_by_chat.values():
+        for m in members:
+            member_id = m.get("id") or ""
+            member_name = (m.get("name") or "").strip()
+            if (
+                member_id.startswith("ou_")
+                and member_name
+                and member_name != "未知成员"
+                and not member_name.startswith(("ou_", "oc_", "cli_"))
+            ):
+                member_name_votes[member_id][member_name] += 1
+    member_name_by_id: Dict[str, str] = {
+        member_id: votes.most_common(1)[0][0]
+        for member_id, votes in member_name_votes.items()
+        if votes
+    }
+
     # Fallback team detection: if member data is partial/empty (e.g. member-table
     # list API hit the 50k cap), derive "team" from message senders that appear in
     # multiple chats. A real DR sends across many groups; a customer typically only
     # in their own. Threshold: sender seen in ≥ MIN_DR_CHAT_COUNT distinct chats.
-    # Known operator open_ids → display name. Extend this map as new DRs onboard.
+    # Known operator open_ids → display name. Manual entries override names
+    # discovered from the synced member table.
     KNOWN_DR_NAMES: Dict[str, str] = {
         "ou_6db3209e799b66dd96ba39b3837d025a": "杜小龙",
         "ou_a6a3ba3e754f23f83b7122f87886a98c": "柯蓝",
-        # add 葛畅、王登朋 等：从飞书后台或事件 operator_id 拿到 open_id 后填进来
     }
     MIN_DR_CHAT_COUNT = 3
     sender_chat_set: Dict[str, set] = defaultdict(set)
-    sender_name_hint: Dict[str, str] = dict(KNOWN_DR_NAMES)
+    sender_name_hint: Dict[str, str] = dict(member_name_by_id)
+    sender_name_hint.update(KNOWN_DR_NAMES)
     for c_id, msgs in messages_by_chat.items():
         for m in msgs:
             sid = m.get("sender_id") or ""
@@ -438,6 +536,18 @@ def build_app_data(
                 continue
             sender_chat_set[sid].add(c_id)
     inferred_team_ids: set = {sid for sid, cs in sender_chat_set.items() if len(cs) >= MIN_DR_CHAT_COUNT}
+
+    # 用 list_chat_members（按 chat 查，不会撞 50k 表上限）反查未知 DR 的真实姓名。
+    # 仅当 caller 给了 client 才做（CLI 和 server 都传），且只查那些跨多群、还没名字的。
+    if client is not None:
+        try:
+            extra_hints = load_missing_sender_name_hints(
+                client, sender_chat_set, sender_name_hint,
+                min_chat_count=MIN_DR_CHAT_COUNT,
+            )
+            sender_name_hint.update(extra_hints)
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARN: live DR name enrichment failed: {exc}", file=sys.stderr)
 
     team_speakers: Dict[str, Dict] = {}
     hourly = [0] * 24
@@ -482,9 +592,7 @@ def build_app_data(
                 if sid not in inferred_team_ids:
                     continue
                 seen_team_ids.add(sid)
-                # 取消息体里的发送者名字（如果有）— display_messages 还没建好，
-                # 但消息表 sender 信息只有 id；用 id 短哈希做占位。
-                guess_name = sender_name_hint.get(sid) or KNOWN_DR_NAMES.get(sid) or sid[-6:]
+                guess_name = sender_name_hint.get(sid) or sid[-6:]
                 member = {
                     "id": sid,
                     "name": guess_name,
@@ -530,8 +638,7 @@ def build_app_data(
             side = "team" if any(mem["id"] == sender_id and mem["side"] == "team" for mem in member_objs) else "client"
             if side == "team":
                 last_team_reply_time = max(last_team_reply_time, time_ms)
-                # 取名字优先级：member 表 > KNOWN_DR_NAMES 已配置的 > open_id 末 6 位
-                fallback_name = KNOWN_DR_NAMES.get(sender_id) or (sender_id[-6:] if sender_id else "团队成员")
+                fallback_name = sender_name_hint.get(sender_id) or (sender_id[-6:] if sender_id else "团队成员")
                 team_speakers.setdefault(sender_id, {
                     "id": sender_id,
                     "name": next((mem["name"] for mem in member_objs if mem["id"] == sender_id), fallback_name),
@@ -786,6 +893,7 @@ def main() -> int:
         sync_tz,
         max_messages_per_group,
         broadcasts=broadcasts,
+        client=client,
     )
 
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
