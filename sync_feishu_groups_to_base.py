@@ -1541,13 +1541,18 @@ def main() -> int:
         for payload, chat_record_id in zip(batch_payloads, chat_record_id_list):
             chat_id = str(payload["chat_id"])
             chat_name = str(payload["chat_name"])
-            client.batch_update_groupchat_fields_v1(
-                base_token,
-                chat_table_id,
-                [chat_record_id],
-                chat_id,
-                chat_name,
-            )
+            is_new_chat = bool(payload.get("is_new_chat"))
+
+            # 老群 chat_id 永久稳定 + 名字鲜少变 → lite mode 下跳过单条 GroupChat
+            # 字段回填，省下 17k 个串行 API 调用。仅对新建群（首次入 Base）回填。
+            if is_new_chat or not args.lite_mode:
+                client.batch_update_groupchat_fields_v1(
+                    base_token,
+                    chat_table_id,
+                    [chat_record_id],
+                    chat_id,
+                    chat_name,
+                )
 
             member_rows = build_member_rows(
                 chat_id,
