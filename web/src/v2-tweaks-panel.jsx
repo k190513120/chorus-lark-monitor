@@ -131,6 +131,16 @@ const __TWEAKS_STYLE = `
   .twk-swatch::-webkit-color-swatch-wrapper{padding:0}
   .twk-swatch::-webkit-color-swatch{border:0;border-radius:5.5px}
   .twk-swatch::-moz-color-swatch{border:0;border-radius:5.5px}
+
+  .twk-fab{position:fixed;right:16px;bottom:16px;z-index:2147483646;
+    width:40px;height:40px;border-radius:50%;border:.5px solid rgba(255,255,255,.18);
+    background:rgba(28,28,32,.72);color:rgba(255,255,255,.85);
+    -webkit-backdrop-filter:blur(20px) saturate(160%);backdrop-filter:blur(20px) saturate(160%);
+    box-shadow:0 6px 24px rgba(0,0,0,.35),0 1px 0 rgba(255,255,255,.06) inset;
+    display:flex;align-items:center;justify-content:center;cursor:pointer;
+    font-size:18px;line-height:1;transition:transform .15s ease,background .15s ease}
+  .twk-fab:hover{background:rgba(40,40,46,.85);transform:translateY(-1px)}
+  .twk-fab:active{transform:translateY(0)}
 `;
 
 // ── useTweaks ───────────────────────────────────────────────────────────────
@@ -227,20 +237,25 @@ function TweaksPanel({ title = 'Tweaks', children }) {
     window.addEventListener('mouseup', up);
   };
 
-  if (!open) return null;
   return (
     <>
       <style>{__TWEAKS_STYLE}</style>
-      <div ref={dragRef} className="twk-panel" data-noncommentable=""
-           style={{ right: offsetRef.current.x, bottom: offsetRef.current.y }}>
-        <div className="twk-hd" onMouseDown={onDragStart}>
-          <b>{title}</b>
-          <button className="twk-x" aria-label="Close tweaks"
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onClick={dismiss}>✕</button>
+      {!open && (
+        <button type="button" className="twk-fab" aria-label="Open tweaks"
+                title="Tweaks" onClick={() => setOpen(true)}>⚙</button>
+      )}
+      {open && (
+        <div ref={dragRef} className="twk-panel" data-noncommentable=""
+             style={{ right: offsetRef.current.x, bottom: offsetRef.current.y }}>
+          <div className="twk-hd" onMouseDown={onDragStart}>
+            <b>{title}</b>
+            <button className="twk-x" aria-label="Close tweaks"
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={dismiss}>✕</button>
+          </div>
+          <div className="twk-body">{children}</div>
         </div>
-        <div className="twk-body">{children}</div>
-      </div>
+      )}
     </>
   );
 }
