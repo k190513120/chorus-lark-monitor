@@ -1366,5 +1366,33 @@ async def lark_events_recent(limit: int = 50) -> dict:
 
 # ─── 静态前端 ─────────────────────────────────────────────────────────────────
 # 必须放在所有 /api /admin /ws 路由之后，否则 mount("/") 会拦截显式路由。
+
+# 容器启动时间作为 asset 版本号；新部署 → 新版本号 → 浏览器自动重新拉取。
+ASSETS_VERSION = str(int(time.time()))
+
+@app.get("/")
+async def serve_root() -> Response:
+    """动态注入版本戳到所有 <script src> 上，强制让浏览器在新部署时拉新代码。"""
+    try:
+        with open("web/index.html", "r", encoding="utf-8") as f:
+            html = f.read()
+    except FileNotFoundError:
+        raise HTTPException(404, "web/index.html missing")
+    import re
+    html = re.sub(
+        r'(<script[^>]*src="src/[^"?]*)(")',
+        rf'\1?v={ASSETS_VERSION}\2',
+        html,
+    )
+    html = re.sub(
+        r'(<link[^>]*href="src/[^"?]*)(")',
+        rf'\1?v={ASSETS_VERSION}\2',
+        html,
+    )
+    return Response(content=html, media_type="text/html; charset=utf-8", headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+    })
+
+
 if os.path.isdir("web"):
     app.mount("/", StaticFiles(directory="web", html=True), name="static")
