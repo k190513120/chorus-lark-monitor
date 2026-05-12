@@ -103,6 +103,11 @@ class FeishuAPIError(RuntimeError):
 
 
 TOKEN_EXPIRED_CODES = {99991663, 99991664, 99991668, 99991677}
+# Lark Base 限频 codes（写、读、查、tenant 级），全部退避 retry
+# 800004135 OpenAPIBatchAddRecords limited
+# 800004136 OpenAPIBatchUpdateRecords limited
+# 1254607  tenant 级写限频
+RATE_LIMIT_CODES = {800004135, 800004136, 1254607}
 TOKEN_REFRESH_INTERVAL_SECONDS = 5400  # refresh every 1.5h, tokens expire at 2h
 
 
@@ -211,6 +216,14 @@ class FeishuClient:
                     ):
                         self.authenticate()
                         token_refreshed_on_error = True
+                        continue
+                    # 飞书 Base 写入限频 / 读限频，退避 retry（最后一次仍失败才 raise）
+                    if code in RATE_LIMIT_CODES and attempt < retries:
+                        last_error = FeishuAPIError(
+                            f"{method} {path} failed: code={code} msg={payload.get('msg')}"
+                        )
+                        sleep_s = min(2 ** attempt, 8)
+                        time.sleep(sleep_s)
                         continue
                     raise FeishuAPIError(
                         f"{method} {path} failed: code={code} msg={payload.get('msg')}"

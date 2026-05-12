@@ -134,7 +134,7 @@ def _run_script(module_name: str, argv: list[str], job_name: str) -> int:
 
 
 def _job_daily_sync() -> int:
-    return _run_script(
+    rc = _run_script(
         "sync_feishu_groups_to_base",
         [
             "--scheduled-daily",
@@ -152,6 +152,10 @@ def _job_daily_sync() -> int:
         ],
         "daily-sync",
     )
+    # --refresh-metadata-tables 会重建 chat/member 表，table_id 和 record_id 全变。
+    # 必须失效缓存，否则 webhook 事件会继续写到旧表 → 800030104 not_found。
+    _invalidate_lark_state()
+    return rc
 
 
 def _job_external_join() -> int:
@@ -891,6 +895,21 @@ def _ensure_lark_state() -> dict[str, Any]:
     return _lark_state
 
 
+def _invalidate_lark_state() -> None:
+    """Forces table_ids + chat-record cache to refetch on next access.
+
+    Call after daily-sync `--refresh-metadata-tables`: tables get recreated,
+    table_ids and chat record_ids both change."""
+    global _chat_record_cache_built_at
+    with _lark_state_lock:
+        _lark_state["ready"] = False
+        _lark_state["table_ids"] = {}
+    with _chat_record_cache_lock:
+        _chat_record_cache.clear()
+        _chat_record_cache_built_at = 0.0
+    log.info("[event] lark_state + chat_record_cache invalidated")
+
+
 def _refresh_chat_record_cache_if_stale() -> None:
     """Rebuild chat_id → record_id map from chat 表 (rate-limited)."""
     global _chat_record_cache_built_at
@@ -919,6 +938,45 @@ def _refresh_chat_record_cache_if_stale() -> None:
 
 def _bump_persist_count(label: str) -> None:
     _lark_persist_counts[label] = _lark_persist_counts.get(label, 0) + 1
+
+
+def _create_member_rows_safely(
+    client,
+    base_token: str,
+    member_table_id: str,
+    member_field_defs: list,
+    rows: list,
+    *,
+    chat_record_id: str,
+) -> None:
+    """Write member rows handling两类 link 失败：
+    (1) chat 还没在 chat 表里 -> chat_record_id 为空 -> 整列 '关联群组' 丢弃
+    (2) chat 刚 insert 完最终一致性还没到 -> 800030104 not_found -> 退避 retry 2 次
+    """
+    from sync_feishu_groups_to_base import FeishuAPIError
+
+    field_names = [f["name"] for f in member_field_defs]
+    link_idx = next((i for i, f in enumerate(member_field_defs) if f.get("name") == "关联群组"), -1)
+
+    # case (1): 没有 link，把列丢掉
+    if not chat_record_id and link_idx >= 0:
+        field_names = [n for i, n in enumerate(field_names) if i != link_idx]
+        rows = [[v for i, v in enumerate(r) if i != link_idx] for r in rows]
+        client.batch_create_records(base_token, member_table_id, field_names, rows)
+        return
+
+    # case (2): 带 link 写，遇到最终一致性 not_found 时退避 retry
+    for attempt in range(3):
+        try:
+            client.batch_create_records(base_token, member_table_id, field_names, rows)
+            return
+        except FeishuAPIError as e:
+            if "800030104" in str(e) and attempt < 2:
+                sleep_s = 0.5 * (2 ** attempt)
+                log.info("[member-write] link not_found, retry %d/3 in %.1fs", attempt + 1, sleep_s)
+                time.sleep(sleep_s)
+                continue
+            raise
 
 
 def _process_message_event(body: dict) -> None:
@@ -1032,17 +1090,14 @@ def _process_member_added_event(body: dict) -> None:
         rows = build_member_rows(chat_id, chat_name, chat_record_id, members, sync_run_id)
         if not rows:
             return
-        # 关联群组 link 在 BASE_MEMBER_FIELD_DEFS 里是第 3 列（index 2）。
-        if not chat_record_id:
-            for r in rows:
-                r[2] = None
         member_field_defs = materialize_field_defs(BASE_MEMBER_FIELD_DEFS, chat_table_id)
-        member_fields = [f["name"] for f in member_field_defs]
-        state["client"].batch_create_records(
-            state["base_token"], member_table_id, member_fields, rows
+        _create_member_rows_safely(
+            state["client"], state["base_token"], member_table_id,
+            member_field_defs, rows, chat_record_id=chat_record_id,
         )
         _bump_persist_count("member-add")
-        log.info("[event/member-add] +%d users in chat %s", len(rows), chat_id)
+        log.info("[event/member-add] +%d users in chat %s (link=%s)",
+                 len(rows), chat_id, "yes" if chat_record_id else "dropped")
     except Exception:
         log.exception("[event/member-add] failed")
 
@@ -1264,10 +1319,12 @@ def _process_bot_added_event(body: dict) -> None:
             member_table_id = state["table_ids"].get(MEMBER_TABLE_NAME)
             if member_table_id:
                 mfd = materialize_field_defs(BASE_MEMBER_FIELD_DEFS, chat_table_id)
-                m_fields = [f["name"] for f in mfd]
                 m_rows = build_member_rows(chat_id, chat_name, chat_record_id, members, sync_run_id)
                 if m_rows:
-                    client.batch_create_records(base_token, member_table_id, m_fields, m_rows)
+                    _create_member_rows_safely(
+                        client, base_token, member_table_id, mfd, m_rows,
+                        chat_record_id=chat_record_id,
+                    )
 
         # 5) recent 24h messages backfill (best-effort; capped to 200 to keep handler bounded)
         msg_count = 0
