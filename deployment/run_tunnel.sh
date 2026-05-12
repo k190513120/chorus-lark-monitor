@@ -10,4 +10,4 @@ if [[ ! -s "$TOKEN_FILE" ]]; then
 fi
 
 TOKEN="$(cat "$TOKEN_FILE")"
-exec /opt/homebrew/bin/cloudflared tunnel --no-autoupdate run --token "$TOKEN"
+exec /opt/homebrew/bin/cloudflared tunnel --no-autoupdate --protocol http2 run --token "$TOKEN"
