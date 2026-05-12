@@ -35,8 +35,9 @@ function isReadAllowed(path) {
 
 function isCacheable(method, path) {
   if (method !== "GET") return false;
-  return path === "/" || path === "/index.html" ||
-    path.startsWith("/src/") || path.startsWith("/api/dashboard/");
+  // HTML 自己不缓存（自带 ASSETS_VERSION 注入，每次发版都要拿最新）；
+  // 只缓存带 querystring 版本号的静态 /src/* 和 /api/dashboard/*。
+  return path.startsWith("/src/") || path.startsWith("/api/dashboard/");
 }
 
 // 构造一个稳定的 cache key：用 host + path + 是否接受 gzip 区分
@@ -111,11 +112,13 @@ async function forward(request, env, ctx, pathAndQuery, timeoutMs) {
     return resp;
   }
 
-  // miss：回源 + 写 cache
+  // miss：回源 + 写 cache（除非 origin 明确说不要缓存——避免把 dashboard
+  // warm-up 期间的空 payload 固化到 CF Edge，造成"看板永远 0 群在册"。）
   const origin = await fetchFromOrigin(request, env, pathAndQuery, timeoutMs);
-  if (origin.status === 200) {
+  const originCC = (origin.headers.get("cache-control") || "").toLowerCase();
+  const wantNoCache = originCC.includes("no-store") || originCC.includes("no-cache") || originCC.includes("private");
+  if (origin.status === 200 && !wantNoCache) {
     const toCache = origin.clone();
-    // 覆写 cache-control 让 CF Cache API 强制缓存 EDGE_CACHE_TTL 秒
     const cacheHeaders = new Headers(toCache.headers);
     cacheHeaders.set("cache-control", `public, max-age=${EDGE_CACHE_TTL}, s-maxage=${EDGE_CACHE_TTL}`);
     const cacheResp = new Response(toCache.body, {
@@ -126,7 +129,7 @@ async function forward(request, env, ctx, pathAndQuery, timeoutMs) {
     ctx.waitUntil(cache.put(cacheKey, cacheResp));
   }
   const resp = new Response(origin.body, origin);
-  resp.headers.set("x-cache", "MISS");
+  resp.headers.set("x-cache", wantNoCache ? "BYPASS" : "MISS");
   return resp;
 }
 

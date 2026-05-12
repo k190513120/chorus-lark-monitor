@@ -535,10 +535,14 @@ async def serve_dashboard_data_jsx() -> Response:
     """Drop-in replacement for the static web/src/data.jsx."""
     import export_to_web as ex
     cached = _dashboard_cache.get("data")
-    if not cached:
+    is_empty_warmup = not cached
+    if is_empty_warmup:
         # First page load before cache warmed: kick off build, return a minimal
         # AppData with empty arrays so the dashboard at least mounts. The user
         # will see "building" state and can refresh.
+        # CRITICAL: must NOT cache this empty payload at CF Edge — otherwise the
+        # empty version sticks around for cache TTL even after data is ready,
+        # leading to the dashboard being permanently "0 群在册".
         _ensure_dashboard_rebuild_running()
         payload = {
             "TEAM": [],
@@ -571,13 +575,17 @@ async def serve_dashboard_data_jsx() -> Response:
         member_count=sum(len(g.get("members", [])) for g in payload.get("GROUPS") or []),
         payload=serialized,
     )
-    # Cache-Control: CF Edge 缓存 60s（business 看到的 staleness 最多 60s，可接受），
-    # browser 1min。这样跨海上行只用一次，后续从 CF Edge 秒级响应。
+    if is_empty_warmup:
+        cache_ctrl = "no-store, no-cache, must-revalidate"
+    else:
+        # Cache-Control: CF Edge 缓存 60s（business 看到的 staleness 最多 60s，可接受），
+        # browser 1min。这样跨海上行只用一次，后续从 CF Edge 秒级响应。
+        cache_ctrl = "public, max-age=60, s-maxage=60"
     return Response(
         content=js,
         media_type="application/javascript; charset=utf-8",
         headers={
-            "Cache-Control": "public, max-age=60, s-maxage=60",
+            "Cache-Control": cache_ctrl,
             "Vary": "Accept-Encoding",
         },
     )
