@@ -38,7 +38,7 @@ async function forward(request, env, pathAndQuery, timeoutMs) {
 
   const headers = new Headers();
   for (const h of [
-    "content-type", "accept", "accept-language", "user-agent",
+    "content-type", "accept", "accept-language", "accept-encoding", "user-agent",
     "x-lark-signature", "x-lark-request-timestamp", "x-lark-request-nonce",
   ]) {
     const v = request.headers.get(h);
@@ -55,15 +55,30 @@ async function forward(request, env, pathAndQuery, timeoutMs) {
     }
   }
 
+  // CF Edge cache 配置：只缓存 GET 的 dashboard 资源（webhook POST 不缓存，避免回 Lark 错误响应）
+  const path = pathAndQuery.split("?")[0];
+  const cacheable = request.method === "GET" && (
+    path === "/" || path === "/index.html" ||
+    path.startsWith("/src/") || path.startsWith("/api/dashboard/")
+  );
+
+  const fetchOpts = {
+    method: request.method,
+    headers,
+    body,
+    signal: AbortSignal.timeout(timeoutMs),
+  };
+  if (cacheable) {
+    fetchOpts.cf = { cacheEverything: true, cacheTtl: 60 };  // 60s edge cache
+  }
+
   try {
-    const upstream = await fetch(`${backend}${pathAndQuery}`, {
-      method: request.method,
-      headers,
-      body,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    const upstream = await fetch(`${backend}${pathAndQuery}`, fetchOpts);
     const respHeaders = new Headers();
-    for (const h of ["content-type", "cache-control", "etag", "last-modified"]) {
+    for (const h of [
+      "content-type", "cache-control", "etag", "last-modified",
+      "content-encoding", "content-length", "vary",
+    ]) {
       const v = upstream.headers.get(h);
       if (v) respHeaders.set(h, v);
     }

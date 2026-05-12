@@ -40,6 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response
 
 import local_db
@@ -273,6 +274,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Chorus Lark Monitor", version=VERSION, lifespan=lifespan)
+
+# gzip 压缩 /src/data.jsx 和 /api/dashboard/data 这种大 JSON 响应
+# 9.7 MB → 1 MB (9x)。压缩 minimum_size 设 1024B 避免短响应也压
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # Permissive CORS for now — tighten when the dashboard origin is known.
 app.add_middleware(
@@ -512,7 +517,16 @@ async def serve_dashboard_data_jsx() -> Response:
         member_count=sum(len(g.get("members", [])) for g in payload.get("GROUPS") or []),
         payload=serialized,
     )
-    return Response(content=js, media_type="application/javascript; charset=utf-8")
+    # Cache-Control: CF Edge 缓存 60s（business 看到的 staleness 最多 60s，可接受），
+    # browser 1min。这样跨海上行只用一次，后续从 CF Edge 秒级响应。
+    return Response(
+        content=js,
+        media_type="application/javascript; charset=utf-8",
+        headers={
+            "Cache-Control": "public, max-age=60, s-maxage=60",
+            "Vary": "Accept-Encoding",
+        },
+    )
 
 
 @app.post("/admin/rebuild-dashboard-cache")
