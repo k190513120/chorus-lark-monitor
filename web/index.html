@@ -18,8 +18,10 @@
   <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
   <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
 
-  <!-- 1) 实时数据（FastAPI 动态生成）：window.AppData -->
-  <script type="text/babel" src="src/data.jsx"></script>
+  <!-- 1) 实时数据（FastAPI 动态生成）：window.AppData
+       注意：data.jsx 是纯 JS（无 JSX 语法），故按普通 script 加载。
+       规模 10MB+ 时 Babel standalone 浏览器内编译会卡死或 OOM。 -->
+  <script src="src/data.jsx"></script>
 
   <!-- 2) AppData → MOCK 适配器：构建 design 期望的形状 -->
   <script type="text/babel" src="src/v2-data-adapter.js"></script>

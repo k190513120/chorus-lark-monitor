@@ -41,6 +41,8 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+
+import local_db
 from fastapi.staticfiles import StaticFiles
 from zoneinfo import ZoneInfo
 
@@ -57,7 +59,7 @@ SYNC_TZ = ZoneInfo("Asia/Shanghai")
 
 # Dashboard payload cache (60s) — building it scans Base, can take 30s+ for 16k chats.
 _dashboard_cache: dict[str, Any] = {"data": None, "expires_at": 0.0}
-DASHBOARD_TTL_SEC = 60
+DASHBOARD_TTL_SEC = 600  # 10 min. rebuild 实际要 5-9 min，TTL 太短会持续触发重叠重建
 
 # In-memory bulk-send job tracker. Lost on container restart, fine for short-lived jobs.
 _bulk_jobs: dict[str, dict[str, Any]] = {}
@@ -155,6 +157,18 @@ def _job_daily_sync() -> int:
     # --refresh-metadata-tables 会重建 chat/member 表，table_id 和 record_id 全变。
     # 必须失效缓存，否则 webhook 事件会继续写到旧表 → 800030104 not_found。
     _invalidate_lark_state()
+    # Tier 1: daily-sync 跑完后从 Base 重新 seed 本地 SQLite，
+    # 把过去 24h 内 webhook 漏掉/被限频丢掉的事件捞回来对齐。
+    try:
+        state = _ensure_lark_state()
+        from sync_feishu_groups_to_base import load_timezone
+        sync_tz = load_timezone(os.getenv("SYNC_TIMEZONE", "Asia/Shanghai"))
+        result = local_db.seed_from_lark_base(
+            state["client"], state["base_token"], state["table_ids"], sync_tz,
+        )
+        log.info("[local-db] post-daily-sync reseed: %s", result)
+    except Exception:  # noqa: BLE001
+        log.exception("[local-db] post-daily-sync reseed failed (non-fatal)")
     return rc
 
 
@@ -356,9 +370,25 @@ def _build_dashboard_payload() -> dict:
     member_table_id = export_to_web.find_table_id(client, base_token, MEMBER_TABLE_NAME)
     message_table_id = export_to_web.find_table_id(client, base_token, MESSAGE_TABLE_NAME)
 
-    chats = export_to_web.load_chats(client, base_token, chat_table_id)
-    members_by_chat = export_to_web.load_members(client, base_token, member_table_id)
-    messages_by_chat = export_to_web.load_messages(client, base_token, message_table_id, sync_tz)
+    # ─── Tier 1：本地 SQLite 副本读路径 ───
+    # 如果本地 DB 已有数据（seed 过 + webhook 双写），用 SQL 读 sub-second 完成。
+    # SQLite 空时 fallback 到 Lark Base 全量拉（首次启动 / 灾后恢复）。
+    use_local_db = _local_db_has_data()
+    if use_local_db:
+        cap = max_groups if max_groups > 0 else 5000  # 即使 0=不限，本地也限个上限避免极端
+        top_ids = local_db.top_n_chat_ids_by_activity(cap)
+        chats = local_db.load_chats(chat_ids=top_ids)
+        members_by_chat = local_db.load_members(chat_ids=top_ids)
+        per_chat = max_messages_per_group if max_messages_per_group > 0 else 50
+        messages_by_chat = local_db.load_messages(chat_ids=top_ids, max_per_chat=per_chat)
+        log.info("[dashboard] loaded from local SQLite: %d chats, %d msg-bundles",
+                 len(chats), len(messages_by_chat))
+    else:
+        chats = export_to_web.load_chats(client, base_token, chat_table_id)
+        members_by_chat = export_to_web.load_members(client, base_token, member_table_id)
+        messages_by_chat = export_to_web.load_messages(client, base_token, message_table_id, sync_tz)
+        log.info("[dashboard] loaded from Lark Base (local SQLite empty)")
+
     broadcasts = export_to_web.load_broadcasts(client, base_token, sync_tz)
 
     selected = export_to_web.pick_active_groups(chats, members_by_chat, messages_by_chat, max_groups)
@@ -495,6 +525,64 @@ async def admin_rebuild_dashboard() -> dict:
         "already_building": not started,
         "current_meta": (_dashboard_cache.get("data") or {}).get("_meta", {}),
     }
+
+
+# ─── Tier 1 本地 SQLite admin ─────────────────────────────────────────────────
+
+def _local_db_has_data() -> bool:
+    """SQLite 是否被 seed 过 + 有 chat 数据。决定 dashboard 走 SQL 还是 fallback 拉 Base。"""
+    try:
+        return local_db.get_stats().get("chats", 0) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@app.get("/admin/local-db-stats")
+async def admin_local_db_stats() -> dict:
+    stats = local_db.get_stats()
+    stats["last_seeded_at"] = local_db.get_meta("last_seeded_at")
+    stats["last_seed_counts"] = local_db.get_meta("last_seed_counts")
+    return stats
+
+
+_seed_lock = threading.Lock()
+_seed_in_progress = {"running": False, "started_at": None, "result": None}
+
+
+def _do_seed_local_db() -> dict:
+    try:
+        state = _ensure_lark_state()
+        from sync_feishu_groups_to_base import load_timezone
+        sync_tz = load_timezone(os.getenv("SYNC_TIMEZONE", "Asia/Shanghai"))
+        result = local_db.seed_from_lark_base(
+            state["client"], state["base_token"], state["table_ids"], sync_tz,
+        )
+        log.info("[local-db] seed done: %s", result)
+        _seed_in_progress["result"] = result
+        return result
+    except Exception as exc:  # noqa: BLE001
+        log.exception("[local-db] seed failed")
+        err = {"error": str(exc)}
+        _seed_in_progress["result"] = err
+        return err
+    finally:
+        _seed_in_progress["running"] = False
+
+
+@app.post("/admin/seed-local-db")
+async def admin_seed_local_db() -> dict:
+    """从 Lark Base 全量拉一次回填 SQLite。一次性，~5-9 min。"""
+    with _seed_lock:
+        if _seed_in_progress["running"]:
+            return {"ok": True, "queued": False, "already_running": True,
+                    "started_at": _seed_in_progress["started_at"]}
+        _seed_in_progress["running"] = True
+        _seed_in_progress["started_at"] = int(time.time())
+        _seed_in_progress["result"] = None
+    asyncio.create_task(asyncio.to_thread(_do_seed_local_db))
+    return {"ok": True, "queued": True,
+            "started_at": _seed_in_progress["started_at"],
+            "note": "5-9 min for fresh seed. Poll /admin/local-db-stats for progress."}
 
 
 # ─── /api/bulk-send + /ws/bulk-progress ───────────────────────────────────────
@@ -1041,6 +1129,30 @@ def _process_message_event(body: dict) -> None:
         state["client"].batch_create_records(
             state["base_token"], msg_table_id, message_fields, [row]
         )
+        # Tier 1: 同步写本地 SQLite，让 dashboard 看到最新消息
+        try:
+            try:
+                ct = int(msg.get("create_time"))
+                time_ms = ct if ct > 10**12 else ct * 1000
+            except (TypeError, ValueError):
+                time_ms = int(time.time() * 1000)
+            content_obj = msg.get("content")
+            if isinstance(content_obj, str):
+                try:
+                    content_obj = json.loads(content_obj)
+                except Exception:  # noqa: BLE001
+                    content_obj = None
+            text_val = (content_obj or {}).get("text") if isinstance(content_obj, dict) else None
+            local_db.upsert_message(
+                message_id, chat_id,
+                sender_id=(sender.get("sender_id") or {}).get("open_id"),
+                sender_type=sender.get("sender_type"),
+                time_ms=time_ms,
+                text=text_val or str(msg.get("content") or "")[:1000],
+                msg_type=msg.get("message_type"),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("[event/message] local_db upsert failed (non-fatal)")
         _bump_persist_count("message")
         log.info("[event/message] persisted msg=%s chat=%s record_id=%s", message_id, chat_id, chat_record_id or "(missing)")
     except Exception:
@@ -1095,6 +1207,15 @@ def _process_member_added_event(body: dict) -> None:
             state["client"], state["base_token"], member_table_id,
             member_field_defs, rows, chat_record_id=chat_record_id,
         )
+        # Tier 1: 双写本地 SQLite
+        try:
+            local_db.upsert_chat(chat_id, name=chat_name or None)
+            local_db.upsert_members_bulk(chat_id, [
+                {"id": m["member_id"], "name": m.get("name"), "tenant_key": m.get("tenant_key")}
+                for m in members
+            ])
+        except Exception:  # noqa: BLE001
+            log.exception("[event/member-add] local_db upsert failed (non-fatal)")
         _bump_persist_count("member-add")
         log.info("[event/member-add] +%d users in chat %s (link=%s)",
                  len(rows), chat_id, "yes" if chat_record_id else "dropped")
@@ -1176,6 +1297,12 @@ def _process_member_deleted_event(body: dict) -> None:
             _bump_persist_count("member-del")
         else:
             log.info("[event/member-del] no matching rows for chat %s users=%s", chat_id, list(target_open_ids))
+        # Tier 1: 双写本地 SQLite
+        try:
+            for oid in target_open_ids:
+                local_db.delete_member(chat_id, oid)
+        except Exception:  # noqa: BLE001
+            log.exception("[event/member-del] local_db delete failed (non-fatal)")
     except Exception:
         log.exception("[event/member-del] failed")
 
@@ -1216,6 +1343,11 @@ def _process_message_recalled_event(body: dict) -> None:
         rows = [["true"] for _ in record_ids]
         client.batch_update_records_v1(base_token, msg_table_id, ["是否已删除"], record_ids, rows)
         log.info("[event/recall] marked msg %s deleted (%d rows)", msg_id, len(record_ids))
+        # Tier 1: 双写本地 SQLite
+        try:
+            local_db.mark_message_deleted(msg_id)
+        except Exception:  # noqa: BLE001
+            log.exception("[event/recall] local_db mark failed (non-fatal)")
         _bump_persist_count("message-recall")
     except Exception:
         log.exception("[event/recall] failed")
@@ -1245,6 +1377,11 @@ def _process_chat_disbanded_event(body: dict) -> None:
         # Drop from cache so future lookups don't return a dissolved record_id silently
         _chat_record_cache.pop(chat_id, None)
         log.info("[event/disbanded] marked chat %s dissolved", chat_id)
+        # Tier 1: 本地 SQLite 也清掉
+        try:
+            local_db.delete_chat(chat_id)
+        except Exception:  # noqa: BLE001
+            log.exception("[event/disbanded] local_db delete failed (non-fatal)")
         _bump_persist_count("chat-disbanded")
     except Exception:
         log.exception("[event/disbanded] failed")
@@ -1344,6 +1481,54 @@ def _process_bot_added_event(body: dict) -> None:
                 rows = [build_message_row(m, chat_name, chat_record_id, sync_run_id, SYNC_TZ) for m in messages]
                 client.batch_create_records(base_token, msg_table_id, msg_fields, rows)
                 msg_count = len(rows)
+
+        # Tier 1: 双写本地 SQLite（chat / members / 24h 消息全部写一遍）
+        try:
+            local_db.upsert_chat(
+                chat_id,
+                name=chat_name or None,
+                record_id=chat_record_id or None,
+                member_total=member_total,
+            )
+            if members:
+                local_db.upsert_members_bulk(chat_id, [
+                    {"id": m.get("member_id"), "name": m.get("name"), "tenant_key": m.get("tenant_key")}
+                    for m in members
+                ])
+            if messages:
+                local_msgs = []
+                for m in messages:
+                    body_content = (m.get("body") or {}).get("content") or m.get("body") or ""
+                    if isinstance(body_content, dict):
+                        try:
+                            body_content = body_content.get("text") or json.dumps(body_content, ensure_ascii=False)[:1000]
+                        except Exception:  # noqa: BLE001
+                            body_content = str(body_content)[:1000]
+                    elif isinstance(body_content, str):
+                        try:
+                            parsed = json.loads(body_content)
+                            if isinstance(parsed, dict):
+                                body_content = parsed.get("text") or body_content[:1000]
+                        except Exception:  # noqa: BLE001
+                            pass
+                    sender = m.get("sender") or {}
+                    try:
+                        ct = int(m.get("create_time") or 0)
+                        t_ms = ct if ct > 10**12 else ct * 1000
+                    except (TypeError, ValueError):
+                        t_ms = 0
+                    local_msgs.append({
+                        "id": m.get("message_id"),
+                        "chat_id": chat_id,
+                        "sender_id": sender.get("id"),
+                        "sender_type": sender.get("sender_type") or sender.get("id_type"),
+                        "time": t_ms,
+                        "text": body_content,
+                        "msg_type": m.get("msg_type"),
+                    })
+                local_db.upsert_messages_bulk(local_msgs)
+        except Exception:  # noqa: BLE001
+            log.exception("[event/bot-added] local_db upsert failed (non-fatal)")
 
         log.info(
             "[event/bot-added] chat=%s name=%s members=%d msgs=%d",

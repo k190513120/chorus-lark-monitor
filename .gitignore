@@ -10,3 +10,8 @@ logs/
 .external_group_join_state.json
 .bulk_message_probe_state.json
 .wrangler/
+
+# Tier 1 本地 SQLite 副本（运行时数据，不入库）
+chorus_local.db
+chorus_local.db-shm
+chorus_local.db-wal
