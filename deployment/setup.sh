@@ -29,7 +29,7 @@ echo "✅ .env 配置正常"
 mkdir -p "$PROJECT_DIR/logs"
 
 # 3. 卸载旧版（如有）
-for plist in com.feishu-chat.daily-sync com.feishu-chat.group-join com.feishu-chat.export-web com.feishu-chat.web; do
+for plist in com.feishu-chat.daily-sync com.feishu-chat.group-join com.feishu-chat.export-web com.feishu-chat.bulk-stats com.feishu-chat.web; do
   if launchctl list "$plist" &>/dev/null; then
     launchctl unload "$LA_DIR/$plist.plist" 2>/dev/null || true
     echo "  卸载旧版: $plist"
@@ -38,7 +38,7 @@ for plist in com.feishu-chat.daily-sync com.feishu-chat.group-join com.feishu-ch
 done
 
 # 4. 安装 plist
-for plist in com.feishu-chat.daily-sync com.feishu-chat.group-join com.feishu-chat.export-web com.feishu-chat.web; do
+for plist in com.feishu-chat.daily-sync com.feishu-chat.group-join com.feishu-chat.export-web com.feishu-chat.bulk-stats com.feishu-chat.web; do
   cp "$SCRIPT_DIR/$plist.plist" "$LA_DIR/"
   launchctl load "$LA_DIR/$plist.plist"
   echo "  ✅ 已加载: $plist"
@@ -50,6 +50,7 @@ echo ""
 echo "定时任务："
 echo "  每日 10:00  群消息增量同步"
 echo "  每日 10:30  导出前端数据"
+echo "  每日 20:00  刷新群发消息已读统计"
 echo "  每日 22:00  拉机器人进外部群"
 echo ""
 echo "常驻服务："

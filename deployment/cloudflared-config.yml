@@ -1,0 +1,29 @@
+# cloudflared tunnel 配置 · Mac mini 端
+#
+# 这个文件应该 cp 到 ~/.cloudflared/config.yml
+# 然后 cloudflared tunnel run <tunnel-name> 会自动读它。
+#
+# 关键参数等你在 cloudflared tunnel create 后填进来：
+#   - tunnel: 隧道 UUID
+#   - credentials-file: ~/.cloudflared/<UUID>.json
+#
+# ingress 部分说明：
+#   chorus-origin.xiaomiao.win 是 Worker 转发的目标域名
+#   它会接 127.0.0.1:5678 的 uvicorn，再走 server.py 的 /lark/events 路由
+#
+# 注意：xiaomiao.win 是你的 zone，子域 chorus-origin 需要 cloudflared 帮忙在 DNS 建 CNAME
+#       这一步用 `cloudflared tunnel route dns <tunnel> chorus-origin.xiaomiao.win` 做
+
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: /Users/bytedance/.cloudflared/REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  # Worker 期望的后端
+  - hostname: chorus-origin.xiaomiao.win
+    service: http://127.0.0.1:5678
+    originRequest:
+      connectTimeout: 10s
+      # 防止 server.py 自身慢响应导致 webhook 飞书侧超时
+      noTLSVerify: true
+  # catch-all（必须有，cloudflared 要求）
+  - service: http_status:404

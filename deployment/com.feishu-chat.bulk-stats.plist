@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.feishu-chat.group-join</string>
+  <string>com.feishu-chat.bulk-stats</string>
 
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/bytedance/chorus-lark-monitor/deployment/run_group_join.sh</string>
+    <string>/Users/bytedance/chorus-lark-monitor/deployment/run_bulk_stats.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -20,19 +20,19 @@
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
 
-  <!-- 每天北京时间 22:00 拉机器人进新群 -->
+  <!-- 每天北京时间 20:00 刷新群发消息已读统计 -->
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key>
-    <integer>22</integer>
+    <integer>20</integer>
     <key>Minute</key>
     <integer>0</integer>
   </dict>
 
   <key>StandardOutPath</key>
-  <string>/Users/bytedance/chorus-lark-monitor/logs/group-join.out.log</string>
+  <string>/Users/bytedance/chorus-lark-monitor/logs/bulk-stats.out.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/bytedance/chorus-lark-monitor/logs/group-join.err.log</string>
+  <string>/Users/bytedance/chorus-lark-monitor/logs/bulk-stats.err.log</string>
 </dict>
 </plist>

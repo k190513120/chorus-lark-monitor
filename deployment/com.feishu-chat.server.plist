@@ -3,23 +3,19 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.feishu-chat.web</string>
+  <string>com.feishu-chat.server</string>
 
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/bytedance/chorus-lark-monitor/deployment/run_web_server.sh</string>
+    <string>/Users/bytedance/chorus-lark-monitor/deployment/run_server.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/bytedance/chorus-lark-monitor/web</string>
+  <string>/Users/bytedance/chorus-lark-monitor</string>
 
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PORT</key>
-    <string>5678</string>
-    <key>HOST</key>
-    <string>127.0.0.1</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
@@ -30,10 +26,14 @@
   <key>KeepAlive</key>
   <true/>
 
+  <!-- 重启间隔（崩溃后），默认 10 秒，避免疯狂重启 -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
   <key>StandardOutPath</key>
-  <string>/Users/bytedance/chorus-lark-monitor/logs/web-server.out.log</string>
+  <string>/Users/bytedance/chorus-lark-monitor/logs/server.out.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/bytedance/chorus-lark-monitor/logs/web-server.err.log</string>
+  <string>/Users/bytedance/chorus-lark-monitor/logs/server.err.log</string>
 </dict>
 </plist>

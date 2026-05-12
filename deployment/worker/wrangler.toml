@@ -1,0 +1,14 @@
+name = "chorus-lark-events-gateway"
+main = "src/index.js"
+compatibility_date = "2026-05-01"
+
+# custom_domain：Worker 拦截 chorus.xiaomiao.win 所有路径
+# 路径白名单（只放 /lark/events）由 Worker 代码处理
+# wrangler 部署时会自动建 DNS 记录
+[[routes]]
+pattern = "chorus.xiaomiao.win"
+custom_domain = true
+
+# 环境变量：tunnel origin（Mac mini 通过 cloudflared 暴露出来的子域）
+[vars]
+BACKEND_BASE = "https://chorus-origin.xiaomiao.win"

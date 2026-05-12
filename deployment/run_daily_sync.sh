@@ -2,9 +2,9 @@
 # 群聊消息每日增量同步
 set -euo pipefail
 
-cd /Users/bytedance/Desktop/群聊消息统计
+cd /Users/bytedance/chorus-lark-monitor
 
-source .env 2>/dev/null || true
+set -a; source .env 2>/dev/null || true; set +a
 
 exec python3 sync_feishu_groups_to_base.py \
   --scheduled-daily \
