@@ -35,6 +35,7 @@ from typing import Any
 from apscheduler.executors.pool import ThreadPoolExecutor as APSThreadPoolExecutor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -189,10 +190,51 @@ def _job_bulk_refresh() -> int:
     )
 
 
+# CF Edge cache 预热目标。打公网 URL 让 CF Edge 始终持有热副本，避免首次访问踩
+# tunnel 冷路径（~12s/MB）。Worker 端 EDGE_CACHE_TTL=300s，所以间隔 240s。
+CF_PREWARM_URL = os.getenv("CF_PREWARM_URL", "https://chorus.xiaomiao.win")
+CF_PREWARM_PATHS = [
+    "/",
+    "/src/data.jsx",
+    "/src/v2-styles.css",
+    "/src/app.jsx",
+    "/src/broadcast.jsx",
+    "/src/icons.jsx",
+    "/src/ui.jsx",
+    "/src/v2-components.jsx",
+    "/src/v2-data-adapter.js",
+    "/src/v2-tweaks-panel.jsx",
+    "/src/v2-views.jsx",
+]
+
+
+def _job_cf_prewarm() -> None:
+    if not CF_PREWARM_URL:
+        return
+    try:
+        import httpx
+    except Exception:  # noqa: BLE001
+        log.warning("[prewarm] httpx not available, skipping")
+        return
+    headers = {"Accept-Encoding": "gzip", "User-Agent": "chorus-prewarm/1.0"}
+    with httpx.Client(timeout=30.0, headers=headers, follow_redirects=False) as cli:
+        for p in CF_PREWARM_PATHS:
+            url = f"{CF_PREWARM_URL.rstrip('/')}{p}"
+            try:
+                r = cli.get(url)
+                log.info(
+                    "[prewarm] %s -> %d %dB x-cache=%s",
+                    p, r.status_code, len(r.content), r.headers.get("x-cache", "-"),
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("[prewarm] %s failed: %s", url, e)
+
+
 JOB_FUNCS = {
     "daily-sync": _job_daily_sync,
     "external-join": _job_external_join,
     "bulk-stats-refresh": _job_bulk_refresh,
+    "cf-prewarm": _job_cf_prewarm,
 }
 
 
@@ -244,6 +286,18 @@ def _start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=3600,
+    )
+    # CF Edge cache 预热：每 4 分钟跑一次（Worker EDGE_CACHE_TTL=300s），
+    # 让公网首访也走 cache，不再吃 tunnel 12s 冷路径。
+    sch.add_job(
+        _job_cf_prewarm,
+        IntervalTrigger(seconds=240),
+        id="cf-prewarm",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+        next_run_time=datetime.now(),  # 启动后立即跑一次
     )
     sch.start()
     for job in sch.get_jobs():
