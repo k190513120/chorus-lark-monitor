@@ -97,7 +97,13 @@ _seen_event_ids = _LRUSet(maxsize=10000)
 
 # Background pool for event processing — webhook returns 200 immediately,
 # actual Base writes happen here.
-_event_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lark-event")
+# 容量推算：Base 单表写限频 ~20/s，单条写延时 ~1s。worker=12 时理论吞吐
+# 12 msg/s，仍低于飞书限频。SQLite WAL 单写者会自动串行化，不会冲突。
+# 可通过 LARK_EVENT_POOL_SIZE 环境变量临时调整。
+_event_pool = ThreadPoolExecutor(
+    max_workers=int(os.getenv("LARK_EVENT_POOL_SIZE", "12")),
+    thread_name_prefix="lark-event",
+)
 
 # Cached Lark client + Base table ids (lazy-init on first event).
 _lark_state: dict[str, Any] = {"ready": False}
@@ -1104,6 +1110,11 @@ def _bump_persist_count(label: str) -> None:
     _lark_persist_counts[label] = _lark_persist_counts.get(label, 0) + 1
 
 
+# 飞书 Base batch_create_records 单批硬上限：200 行。超过会返回
+# code=800010701 "Array must contain at most 200 element(s)"
+_BASE_BATCH_MAX = 200
+
+
 def _create_member_rows_safely(
     client,
     base_token: str,
@@ -1113,9 +1124,10 @@ def _create_member_rows_safely(
     *,
     chat_record_id: str,
 ) -> None:
-    """Write member rows handling两类 link 失败：
+    """Write member rows handling三类 link 失败：
     (1) chat 还没在 chat 表里 -> chat_record_id 为空 -> 整列 '关联群组' 丢弃
     (2) chat 刚 insert 完最终一致性还没到 -> 800030104 not_found -> 退避 retry 2 次
+    (3) 单批 >200 行 -> 800010701 -> 按 _BASE_BATCH_MAX 切片
     """
     from sync_feishu_groups_to_base import FeishuAPIError
 
@@ -1126,21 +1138,24 @@ def _create_member_rows_safely(
     if not chat_record_id and link_idx >= 0:
         field_names = [n for i, n in enumerate(field_names) if i != link_idx]
         rows = [[v for i, v in enumerate(r) if i != link_idx] for r in rows]
-        client.batch_create_records(base_token, member_table_id, field_names, rows)
-        return
 
-    # case (2): 带 link 写，遇到最终一致性 not_found 时退避 retry
-    for attempt in range(3):
-        try:
-            client.batch_create_records(base_token, member_table_id, field_names, rows)
-            return
-        except FeishuAPIError as e:
-            if "800030104" in str(e) and attempt < 2:
-                sleep_s = 0.5 * (2 ** attempt)
-                log.info("[member-write] link not_found, retry %d/3 in %.1fs", attempt + 1, sleep_s)
-                time.sleep(sleep_s)
-                continue
-            raise
+    # case (3): 切片，每片单独写。每片内部独立 retry 处理 not_found (case 2)
+    for start in range(0, len(rows), _BASE_BATCH_MAX):
+        chunk = rows[start : start + _BASE_BATCH_MAX]
+        for attempt in range(3):
+            try:
+                client.batch_create_records(base_token, member_table_id, field_names, chunk)
+                break
+            except FeishuAPIError as e:
+                if "800030104" in str(e) and attempt < 2:
+                    sleep_s = 0.5 * (2 ** attempt)
+                    log.info(
+                        "[member-write] link not_found, retry %d/3 in %.1fs (chunk %d-%d)",
+                        attempt + 1, sleep_s, start, start + len(chunk),
+                    )
+                    time.sleep(sleep_s)
+                    continue
+                raise
 
 
 def _process_message_event(body: dict) -> None:
