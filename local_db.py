@@ -95,14 +95,240 @@ def init_db() -> None:
         conn = connect()
         try:
             conn.executescript(SCHEMA)
+            # ─── sync-state 字段（Base 同步用，2026-05-13 加）────────────────
+            # primary  = 旧 Base (LARK_BASE_URL)
+            # secondary = 新 Base (LARK_BASE_URL_SECONDARY)
+            # 历史数据 (来自 daily-sync seed) 一律标 primary_synced=1，避免被 worker 重写。
+            # secondary 默认 0，等 worker 回补。
+            _migrate_add_column(conn, "chats", "secondary_record_id", "TEXT")
+            _migrate_add_column(conn, "chats", "primary_synced", "INTEGER DEFAULT 0")
+            _migrate_add_column(conn, "chats", "secondary_synced", "INTEGER DEFAULT 0")
+            _migrate_add_column(conn, "chats", "sync_attempts", "INTEGER DEFAULT 0")
+            _migrate_add_column(conn, "chats", "sync_last_error", "TEXT")
+            _migrate_add_column(conn, "messages", "primary_record_id", "TEXT")
+            _migrate_add_column(conn, "messages", "secondary_record_id", "TEXT")
+            _migrate_add_column(conn, "messages", "primary_synced", "INTEGER DEFAULT 0")
+            _migrate_add_column(conn, "messages", "secondary_synced", "INTEGER DEFAULT 0")
+            _migrate_add_column(conn, "messages", "sync_attempts", "INTEGER DEFAULT 0")
+            _migrate_add_column(conn, "messages", "sync_last_error", "TEXT")
+            _migrate_add_column(conn, "messages", "raw_event_json", "TEXT")
+            _migrate_add_column(conn, "members", "primary_record_id", "TEXT")
+            _migrate_add_column(conn, "members", "secondary_record_id", "TEXT")
+            _migrate_add_column(conn, "members", "primary_synced", "INTEGER DEFAULT 0")
+            _migrate_add_column(conn, "members", "secondary_synced", "INTEGER DEFAULT 0")
+            _migrate_add_column(conn, "members", "sync_attempts", "INTEGER DEFAULT 0")
+            _migrate_add_column(conn, "members", "sync_last_error", "TEXT")
+            # 一次性补：所有历史 chats/messages/members 视为已同步到 primary
+            # (这些数据来自 daily-sync seed，已经在旧 Base 里了)
+            already_marked = conn.execute(
+                "SELECT value FROM meta WHERE key = 'sync_history_marked'"
+            ).fetchone()
+            if not already_marked:
+                conn.execute("UPDATE chats SET primary_synced = 1 WHERE record_id IS NOT NULL")
+                conn.execute("UPDATE messages SET primary_synced = 1")
+                conn.execute("UPDATE members SET primary_synced = 1")
+                conn.execute(
+                    "INSERT INTO meta (key, value, updated_at) VALUES ('sync_history_marked', ?, ?)",
+                    (str(_now_ts()), _now_ts()),
+                )
+            # 索引：sync worker 查询用
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_secondary_pending ON chats(secondary_synced) WHERE secondary_synced = 0")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_secondary_pending ON messages(secondary_synced) WHERE secondary_synced = 0")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_members_secondary_pending ON members(secondary_synced) WHERE secondary_synced = 0")
             conn.commit()
         finally:
             conn.close()
         _initialized = True
 
 
+def _migrate_add_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """Idempotent ALTER TABLE ADD COLUMN. Skips if column already exists."""
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    cols = {row[1] for row in cur.fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def _now_ts() -> int:
     return int(time.time())
+
+
+# ─── sync queue helpers（给 Base sync worker 用） ──────────────────────────────
+
+def get_pending_chats_for_secondary(limit: int = 200) -> List[Dict[str, Any]]:
+    init_db()
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT chat_id, name, description, chat_type_label, member_total, owner_id
+            FROM chats
+            WHERE secondary_synced = 0
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_pending_messages_for_secondary(limit: int = 200) -> List[Dict[str, Any]]:
+    """只取那些其 chat 已经同步到 secondary 的消息（保证 link 字段有 record_id）。"""
+    init_db()
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT m.msg_id, m.chat_id, m.sender_id, m.sender_type, m.time_ms,
+                   m.text, m.msg_type, m.is_deleted, m.raw_event_json,
+                   c.secondary_record_id AS chat_secondary_record_id,
+                   c.name AS chat_name
+            FROM messages m
+            JOIN chats c ON c.chat_id = m.chat_id
+            WHERE m.secondary_synced = 0
+              AND c.secondary_record_id IS NOT NULL
+            ORDER BY m.time_ms ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_pending_members_for_secondary(limit: int = 200) -> List[Dict[str, Any]]:
+    init_db()
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT mb.chat_id, mb.member_open_id, mb.name, mb.tenant_key,
+                   c.secondary_record_id AS chat_secondary_record_id,
+                   c.name AS chat_name
+            FROM members mb
+            JOIN chats c ON c.chat_id = mb.chat_id
+            WHERE mb.secondary_synced = 0
+              AND c.secondary_record_id IS NOT NULL
+            ORDER BY mb.updated_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_chats_secondary_synced(chat_to_record_id: Dict[str, str]) -> int:
+    """传入 {chat_id: secondary_record_id}，批量 update。"""
+    if not chat_to_record_id:
+        return 0
+    init_db()
+    conn = connect()
+    n = 0
+    try:
+        for chat_id, rec_id in chat_to_record_id.items():
+            cur = conn.execute(
+                """
+                UPDATE chats
+                SET secondary_record_id = ?, secondary_synced = 1, sync_attempts = 0, sync_last_error = NULL
+                WHERE chat_id = ?
+                """,
+                (rec_id, chat_id),
+            )
+            n += cur.rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def mark_messages_secondary_synced(msg_to_record_id: Dict[str, str]) -> int:
+    if not msg_to_record_id:
+        return 0
+    init_db()
+    conn = connect()
+    n = 0
+    try:
+        for msg_id, rec_id in msg_to_record_id.items():
+            cur = conn.execute(
+                """
+                UPDATE messages
+                SET secondary_record_id = ?, secondary_synced = 1, sync_attempts = 0, sync_last_error = NULL
+                WHERE msg_id = ?
+                """,
+                (rec_id, msg_id),
+            )
+            n += cur.rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def mark_members_secondary_synced(items: List[Dict[str, str]]) -> int:
+    """items: [{chat_id, member_open_id, secondary_record_id}, ...]"""
+    if not items:
+        return 0
+    init_db()
+    conn = connect()
+    n = 0
+    try:
+        for it in items:
+            cur = conn.execute(
+                """
+                UPDATE members
+                SET secondary_record_id = ?, secondary_synced = 1, sync_attempts = 0, sync_last_error = NULL
+                WHERE chat_id = ? AND member_open_id = ?
+                """,
+                (it["secondary_record_id"], it["chat_id"], it["member_open_id"]),
+            )
+            n += cur.rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def bump_sync_failure(table: str, key_col: str, key_vals: List[Any], error_msg: str) -> None:
+    """sync 失败时调，递增 attempts + 写 last_error。table ∈ {chats, messages, members}, key_col ∈ {chat_id, msg_id, member_open_id}"""
+    if not key_vals:
+        return
+    init_db()
+    conn = connect()
+    try:
+        placeholders = ",".join(["?"] * len(key_vals))
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET sync_attempts = COALESCE(sync_attempts, 0) + 1, sync_last_error = ?
+            WHERE {key_col} IN ({placeholders})
+            """,
+            [error_msg[:500]] + list(key_vals),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_sync_queue_stats() -> Dict[str, int]:
+    init_db()
+    conn = connect()
+    try:
+        out = {}
+        for tbl in ("chats", "messages", "members"):
+            out[f"{tbl}_pending_secondary"] = conn.execute(
+                f"SELECT COUNT(*) FROM {tbl} WHERE secondary_synced = 0"
+            ).fetchone()[0]
+            out[f"{tbl}_secondary_done"] = conn.execute(
+                f"SELECT COUNT(*) FROM {tbl} WHERE secondary_synced = 1"
+            ).fetchone()[0]
+        return out
+    finally:
+        conn.close()
 
 
 # ─── upsert helpers (写路径，webhook 处理器 + daily-sync 调用) ────────────────
@@ -141,6 +367,56 @@ def upsert_chat(
             (chat_id, record_id, name, description, chat_type_label, member_total, owner_id, now),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def set_secondary_record_id(chat_id: str, secondary_record_id: str) -> None:
+    """记录新 Base 里这个 chat 的 record_id，给 dual-write 链接字段用。"""
+    if not chat_id or not secondary_record_id:
+        return
+    init_db()
+    conn = connect()
+    try:
+        conn.execute(
+            "UPDATE chats SET secondary_record_id = ? WHERE chat_id = ?",
+            (secondary_record_id, chat_id),
+        )
+        if conn.total_changes == 0:
+            # row 不存在就插入个空骨架记录
+            conn.execute(
+                "INSERT OR IGNORE INTO chats (chat_id, secondary_record_id, updated_at) VALUES (?, ?, ?)",
+                (chat_id, secondary_record_id, _now_ts()),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_secondary_record_id(chat_id: str) -> Optional[str]:
+    """读取新 Base 里这个 chat 的 record_id。返回 None 表示还没回补。"""
+    if not chat_id:
+        return None
+    init_db()
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT secondary_record_id FROM chats WHERE chat_id = ?", (chat_id,),
+        ).fetchone()
+        return row["secondary_record_id"] if row and row["secondary_record_id"] else None
+    finally:
+        conn.close()
+
+
+def load_secondary_record_id_map() -> Dict[str, str]:
+    """一次性 load 所有 chat 的 secondary_record_id 到内存 map，给热路径用。"""
+    init_db()
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT chat_id, secondary_record_id FROM chats WHERE secondary_record_id IS NOT NULL"
+        ).fetchall()
+        return {r["chat_id"]: r["secondary_record_id"] for r in rows}
     finally:
         conn.close()
 

@@ -109,6 +109,18 @@ _event_pool = ThreadPoolExecutor(
 _lark_state: dict[str, Any] = {"ready": False}
 _lark_state_lock = threading.Lock()
 
+# 第二目标 Base（dual-write 阶段）。env: LARK_BASE_URL_SECONDARY 设了才启用。
+_lark_state_secondary: dict[str, Any] = {"ready": False, "enabled": False}
+_lark_state_secondary_lock = threading.Lock()
+
+# Sync worker 计数器（监控用）
+_sync_stats: dict[str, int] = {
+    "chats_synced": 0, "chats_failed": 0,
+    "messages_synced": 0, "messages_failed": 0,
+    "members_synced": 0, "members_failed": 0,
+    "last_run_ts": 0,
+}
+
 # chat_id → record_id cache (refreshed every 10 min)
 _chat_record_cache: dict[str, str] = {}
 _chat_record_cache_built_at = 0.0
@@ -241,6 +253,7 @@ JOB_FUNCS = {
     "external-join": _job_external_join,
     "bulk-stats-refresh": _job_bulk_refresh,
     "cf-prewarm": _job_cf_prewarm,
+    "secondary-sync": lambda: _job_secondary_sync(),  # lazy ref，避免引用前定义问题
 }
 
 
@@ -304,6 +317,17 @@ def _start_scheduler() -> AsyncIOScheduler:
         coalesce=True,
         misfire_grace_time=60,
         next_run_time=datetime.now(),  # 启动后立即跑一次
+    )
+    # Secondary Base 同步 worker：每 15s 一批，回填 + 持续 dual-sync。
+    # LARK_BASE_URL_SECONDARY 未设则 _job_secondary_sync 自动 noop。
+    sch.add_job(
+        _job_secondary_sync,
+        IntervalTrigger(seconds=15),
+        id="secondary-sync",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
     )
     sch.start()
     for job in sch.get_jobs():
@@ -625,6 +649,19 @@ async def admin_local_db_stats() -> dict:
     stats["last_seeded_at"] = local_db.get_meta("last_seeded_at")
     stats["last_seed_counts"] = local_db.get_meta("last_seed_counts")
     return stats
+
+
+@app.get("/admin/sync-stats")
+async def admin_sync_stats() -> dict:
+    """Secondary Base 同步进度。"""
+    queue = local_db.get_sync_queue_stats()
+    state = _ensure_lark_state_secondary()
+    return {
+        "secondary_enabled": bool(state.get("enabled")),
+        "secondary_table_ids": state.get("table_ids", {}),
+        "queue": queue,
+        "counters": dict(_sync_stats),
+    }
 
 
 _seed_lock = threading.Lock()
@@ -1065,6 +1102,46 @@ def _ensure_lark_state() -> dict[str, Any]:
     return _lark_state
 
 
+def _ensure_lark_state_secondary() -> dict[str, Any]:
+    """新 Base 的 lark state，独立于 primary。env LARK_BASE_URL_SECONDARY 未设
+    则 enabled=False，sync worker 跳过执行。"""
+    if _lark_state_secondary.get("ready"):
+        return _lark_state_secondary
+    base_url = os.getenv("LARK_BASE_URL_SECONDARY")
+    if not base_url:
+        _lark_state_secondary.update({"ready": True, "enabled": False})
+        return _lark_state_secondary
+    with _lark_state_secondary_lock:
+        if _lark_state_secondary.get("ready"):
+            return _lark_state_secondary
+        from sync_feishu_groups_to_base import (
+            CHAT_TABLE_NAME,
+            FeishuClient,
+            MEMBER_TABLE_NAME,
+            MESSAGE_TABLE_NAME,
+            parse_base_token,
+        )
+        client = FeishuClient(os.environ["LARK_APP_ID"], os.environ["LARK_APP_SECRET"])
+        client.authenticate()
+        base_token = parse_base_token(base_url)
+        table_ids: dict[str, str] = {}
+        for t in client.list_tables(base_token):
+            name = t.get("name") or t.get("table_name")
+            if name in (CHAT_TABLE_NAME, MEMBER_TABLE_NAME, MESSAGE_TABLE_NAME):
+                tid = t.get("table_id") or t.get("id")
+                if tid:
+                    table_ids[str(name)] = str(tid)
+        _lark_state_secondary.update({
+            "ready": True,
+            "enabled": True,
+            "client": client,
+            "base_token": base_token,
+            "table_ids": table_ids,
+        })
+        log.info("[sync/secondary] state initialized; table_ids=%s", table_ids)
+    return _lark_state_secondary
+
+
 def _invalidate_lark_state() -> None:
     """Forces table_ids + chat-record cache to refetch on next access.
 
@@ -1078,6 +1155,248 @@ def _invalidate_lark_state() -> None:
         _chat_record_cache.clear()
         _chat_record_cache_built_at = 0.0
     log.info("[event] lark_state + chat_record_cache invalidated")
+
+
+# ─── Secondary Base 同步 worker ──────────────────────────────────────────
+#
+# 思路：SQLite 是真源。每个 chat/message/member 行有 secondary_synced 标志。
+# 后台任务定期扫 pending 行，批量写 secondary Base，回填 record_id。
+# 失败不会破坏主链路，下一轮会重试。
+
+def _build_chat_row_minimal(chat_id: str, name: str, description: str,
+                            member_total: int, owner_id: str) -> list:
+    """构造最小可用 chat 行。字段顺序必须与 CHAT_FIELD_DEFS 一致；
+    没数据的字段填空串。"""
+    from sync_feishu_groups_to_base import CHAT_FIELD_DEFS
+    row = []
+    for f in CHAT_FIELD_DEFS:
+        n = f["name"]
+        if n == "群ID":
+            row.append(chat_id or "")
+        elif n == "群名称":
+            row.append(name or "")
+        elif n == "群描述":
+            row.append(description or "")
+        elif n == "用户数":
+            row.append(str(member_total) if member_total else "")
+        elif n == "成员总数":
+            row.append(str(member_total) if member_total else "")
+        elif n == "群主ID":
+            row.append(owner_id or "")
+        elif n == "同步批次":
+            row.append("secondary-sync-backfill")
+        elif n == "同步时间":
+            row.append(datetime.now(SYNC_TZ).strftime("%Y-%m-%d %H:%M:%S"))
+        elif f.get("type") == "select":
+            row.append(None)  # select 类型留空否则会报 invalid option
+        elif f.get("type") == "user":
+            row.append(None)
+        else:
+            row.append("")
+    return row
+
+
+def _sync_chats_to_secondary(batch_size: int = 200) -> dict[str, int]:
+    """Pull pending chats from SQLite → write secondary Base → mark synced."""
+    state = _ensure_lark_state_secondary()
+    if not state.get("enabled"):
+        return {"synced": 0, "failed": 0, "skipped": 0}
+
+    from sync_feishu_groups_to_base import CHAT_FIELD_DEFS, CHAT_TABLE_NAME
+
+    client = state["client"]
+    base_token = state["base_token"]
+    chat_table_id = state["table_ids"].get(CHAT_TABLE_NAME)
+    if not chat_table_id:
+        log.warning("[sync/secondary] %s table not found in new base", CHAT_TABLE_NAME)
+        return {"synced": 0, "failed": 0, "skipped": 1}
+
+    field_names = [f["name"] for f in CHAT_FIELD_DEFS]
+    pending = local_db.get_pending_chats_for_secondary(limit=batch_size)
+    if not pending:
+        return {"synced": 0, "failed": 0, "skipped": 0}
+
+    rows = [_build_chat_row_minimal(
+        p["chat_id"], p["name"], p["description"],
+        p["member_total"], p["owner_id"],
+    ) for p in pending]
+
+    try:
+        resp = client.batch_create_records(base_token, chat_table_id, field_names, rows)
+        new_ids = resp.get("record_id_list") or []
+        if len(new_ids) != len(pending):
+            log.warning("[sync/secondary] chat batch len mismatch: req=%d got=%d", len(pending), len(new_ids))
+        chat_to_rec = {p["chat_id"]: str(rid) for p, rid in zip(pending, new_ids) if rid}
+        marked = local_db.mark_chats_secondary_synced(chat_to_rec)
+        _sync_stats["chats_synced"] += marked
+        return {"synced": marked, "failed": 0, "skipped": 0}
+    except Exception as e:  # noqa: BLE001
+        err = str(e)[:300]
+        log.exception("[sync/secondary] chat batch failed (size=%d): %s", len(pending), err)
+        local_db.bump_sync_failure("chats", "chat_id", [p["chat_id"] for p in pending], err)
+        _sync_stats["chats_failed"] += len(pending)
+        return {"synced": 0, "failed": len(pending), "skipped": 0}
+
+
+def _build_message_row_minimal(chat_record_id_secondary: str, chat_id: str, chat_name: str,
+                               msg_id: str, sender_id: str, sender_type: str,
+                               time_ms: int, text: str, msg_type: str, is_deleted: int) -> list:
+    """根据 BASE_MESSAGE_FIELD_DEFS 字段顺序构造行。link 字段必须用 record_id 列表。"""
+    from sync_feishu_groups_to_base import BASE_MESSAGE_FIELD_DEFS
+    sent_at = ""
+    if time_ms:
+        try:
+            sent_at = datetime.fromtimestamp(time_ms / 1000, tz=SYNC_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    row = []
+    for f in BASE_MESSAGE_FIELD_DEFS:
+        n = f["name"]
+        ftype = f.get("type")
+        if n == "消息ID":
+            row.append(msg_id or "")
+        elif n == "群ID":
+            row.append(chat_id or "")
+        elif n == "群名称":
+            row.append(chat_name or "")
+        elif n == "关联群组":
+            row.append([{"id": chat_record_id_secondary}] if chat_record_id_secondary else None)
+        elif n == "消息类型":
+            row.append(msg_type or "")
+        elif n == "发送时间":
+            row.append(sent_at)
+        elif n == "发送者ID":
+            row.append(sender_id or "")
+        elif n == "发送者类型":
+            row.append(sender_type or "")
+        elif n == "是否已删除":
+            row.append("是" if is_deleted else "否")
+        elif n == "消息内容":
+            row.append(text or "")
+        elif n == "提取消息内容":
+            row.append(text or "")
+        elif n == "同步批次":
+            row.append("secondary-sync-backfill")
+        elif ftype in ("user", "select"):
+            row.append(None)
+        else:
+            row.append("")
+    return row
+
+
+def _sync_messages_to_secondary(batch_size: int = 200) -> dict[str, int]:
+    state = _ensure_lark_state_secondary()
+    if not state.get("enabled"):
+        return {"synced": 0, "failed": 0, "skipped": 0}
+    from sync_feishu_groups_to_base import BASE_MESSAGE_FIELD_DEFS, MESSAGE_TABLE_NAME
+    msg_table_id = state["table_ids"].get(MESSAGE_TABLE_NAME)
+    if not msg_table_id:
+        return {"synced": 0, "failed": 0, "skipped": 1}
+    pending = local_db.get_pending_messages_for_secondary(limit=batch_size)
+    if not pending:
+        return {"synced": 0, "failed": 0, "skipped": 0}
+    field_names = [f["name"] for f in BASE_MESSAGE_FIELD_DEFS]
+    rows = [_build_message_row_minimal(
+        p["chat_secondary_record_id"], p["chat_id"], p["chat_name"],
+        p["msg_id"], p["sender_id"], p["sender_type"],
+        p["time_ms"] or 0, p["text"] or "", p["msg_type"] or "",
+        p["is_deleted"] or 0,
+    ) for p in pending]
+    try:
+        resp = state["client"].batch_create_records(state["base_token"], msg_table_id, field_names, rows)
+        new_ids = resp.get("record_id_list") or []
+        msg_to_rec = {p["msg_id"]: str(rid) for p, rid in zip(pending, new_ids) if rid}
+        marked = local_db.mark_messages_secondary_synced(msg_to_rec)
+        _sync_stats["messages_synced"] += marked
+        return {"synced": marked, "failed": 0, "skipped": 0}
+    except Exception as e:  # noqa: BLE001
+        err = str(e)[:300]
+        log.exception("[sync/secondary] message batch failed (size=%d): %s", len(pending), err)
+        local_db.bump_sync_failure("messages", "msg_id", [p["msg_id"] for p in pending], err)
+        _sync_stats["messages_failed"] += len(pending)
+        return {"synced": 0, "failed": len(pending), "skipped": 0}
+
+
+def _build_member_row_minimal(chat_record_id_secondary: str, chat_id: str, chat_name: str,
+                              member_open_id: str, name: str, tenant_key: str) -> list:
+    from sync_feishu_groups_to_base import BASE_MEMBER_FIELD_DEFS
+    row = []
+    for f in BASE_MEMBER_FIELD_DEFS:
+        n = f["name"]
+        ftype = f.get("type")
+        if n == "群ID":
+            row.append(chat_id or "")
+        elif n == "群名称":
+            row.append(chat_name or "")
+        elif n == "关联群组":
+            row.append([{"id": chat_record_id_secondary}] if chat_record_id_secondary else None)
+        elif n == "成员ID":
+            row.append(member_open_id or "")
+        elif n == "成员ID类型":
+            row.append("open_id")
+        elif n == "成员姓名":
+            row.append(name or "")
+        elif n == "成员租户Key":
+            row.append(tenant_key or "")
+        elif n == "同步批次":
+            row.append("secondary-sync-backfill")
+        elif ftype in ("user", "select"):
+            row.append(None)
+        else:
+            row.append("")
+    return row
+
+
+def _sync_members_to_secondary(batch_size: int = 200) -> dict[str, int]:
+    state = _ensure_lark_state_secondary()
+    if not state.get("enabled"):
+        return {"synced": 0, "failed": 0, "skipped": 0}
+    from sync_feishu_groups_to_base import BASE_MEMBER_FIELD_DEFS, MEMBER_TABLE_NAME
+    mem_table_id = state["table_ids"].get(MEMBER_TABLE_NAME)
+    if not mem_table_id:
+        return {"synced": 0, "failed": 0, "skipped": 1}
+    pending = local_db.get_pending_members_for_secondary(limit=batch_size)
+    if not pending:
+        return {"synced": 0, "failed": 0, "skipped": 0}
+    field_names = [f["name"] for f in BASE_MEMBER_FIELD_DEFS]
+    rows = [_build_member_row_minimal(
+        p["chat_secondary_record_id"], p["chat_id"], p["chat_name"],
+        p["member_open_id"], p["name"] or "", p["tenant_key"] or "",
+    ) for p in pending]
+    try:
+        resp = state["client"].batch_create_records(state["base_token"], mem_table_id, field_names, rows)
+        new_ids = resp.get("record_id_list") or []
+        items = [{"chat_id": p["chat_id"], "member_open_id": p["member_open_id"], "secondary_record_id": str(rid)}
+                 for p, rid in zip(pending, new_ids) if rid]
+        marked = local_db.mark_members_secondary_synced(items)
+        _sync_stats["members_synced"] += marked
+        return {"synced": marked, "failed": 0, "skipped": 0}
+    except Exception as e:  # noqa: BLE001
+        err = str(e)[:300]
+        log.exception("[sync/secondary] member batch failed (size=%d): %s", len(pending), err)
+        local_db.bump_sync_failure(
+            "members", "chat_id",
+            [p["chat_id"] for p in pending],
+            err,
+        )
+        _sync_stats["members_failed"] += len(pending)
+        return {"synced": 0, "failed": len(pending), "skipped": 0}
+
+
+def _job_secondary_sync() -> None:
+    """APScheduler 入口：按顺序跑 chat → msg → member 各一批。"""
+    state = _ensure_lark_state_secondary()
+    if not state.get("enabled"):
+        return
+    _sync_stats["last_run_ts"] = int(time.time())
+    c = _sync_chats_to_secondary()
+    m = _sync_messages_to_secondary()
+    mb = _sync_members_to_secondary()
+    if any(x["synced"] or x["failed"] for x in (c, m, mb)):
+        log.info(
+            "[sync/secondary] tick chat=%s msg=%s member=%s",
+            c, m, mb,
+        )
 
 
 def _refresh_chat_record_cache_if_stale() -> None:
