@@ -286,6 +286,33 @@ class FeishuClient:
     def list_bot_chats(self) -> List[Dict[str, object]]:
         return self.list_chats(self._tenant_token(), tenant_token=True)
 
+    def chat_has_message_since(
+        self,
+        access_token: str,
+        chat_id: str,
+        since_seconds: int,
+    ) -> bool:
+        """检测群在 since_seconds 秒内有无消息。靠 /im/v1/messages 一次拉 1 条
+        最新消息做判定。bot 还没在群里也能用——走 user_access_token。
+        网络/权限错误时返回 True（保守：宁可拉进群也不要错杀）。"""
+        try:
+            data = self._feishu_json(
+                "GET",
+                "/im/v1/messages",
+                access_token=access_token,
+                params={
+                    "container_id": chat_id,
+                    "container_id_type": "chat",
+                    "page_size": 1,
+                    "sort_type": "ByCreateTimeDesc",
+                    "start_time": int(time.time()) - int(since_seconds),
+                },
+            )
+            items = list(data.get("items") or [])
+            return bool(items)
+        except Exception:  # noqa: BLE001
+            return True
+
     def add_bot_to_chat(self, user_access_token: str, chat_id: str) -> Tuple[bool, str]:
         try:
             payload = http_json(
@@ -547,6 +574,7 @@ def collect_targets(
     include_internal: bool,
     limit_chats: int,
     fail_fast: bool,
+    active_since_days: int = 0,
 ) -> Tuple[List[TargetChat], Dict[str, int], List[str]]:
     print("Listing chats the current bot is already in...")
     bot_chats = client.list_bot_chats()
@@ -565,8 +593,10 @@ def collect_targets(
         "user_errors": 0,
         "skipped_missing_scope": 0,
         "skipped_expired": 0,
+        "skipped_inactive": 0,
     }
     errors: List[str] = []
+    active_since_seconds = max(0, active_since_days) * 86400
 
     for idx, user in enumerate(users, start=1):
         print(f"[{idx}/{len(users)}] Listing chats for {user.display}...")
@@ -595,6 +625,7 @@ def collect_targets(
         stats["candidate_chats"] += len(candidates)
 
         user_targets = 0
+        user_inactive = 0
         for item in candidates:
             cid = chat_id(item)
             if cid in bot_chat_ids:
@@ -603,6 +634,14 @@ def collect_targets(
             if cid in seen_target_ids:
                 stats["deduped"] += 1
                 continue
+            # 活跃度过滤：群里 active_since_days 内没消息就跳过。
+            # 网络/权限错误时函数返回 True，宁错拉勿误杀。
+            if active_since_seconds > 0:
+                if not client.chat_has_message_since(access_token, cid, active_since_seconds):
+                    stats["skipped_inactive"] += 1
+                    user_inactive += 1
+                    seen_target_ids.add(cid)  # 同 chat 别的 user 也别再过滤一次
+                    continue
             target = TargetChat(
                 chat_id=cid,
                 name=chat_name(item),
@@ -616,7 +655,8 @@ def collect_targets(
             user_targets += 1
             if limit_chats > 0 and len(targets) >= limit_chats:
                 break
-        print(f"  total={len(chats)} candidate={len(candidates)} new_targets={user_targets}")
+        inactive_tag = f" inactive_skipped={user_inactive}" if active_since_seconds else ""
+        print(f"  total={len(chats)} candidate={len(candidates)} new_targets={user_targets}{inactive_tag}")
         if limit_chats > 0 and len(targets) >= limit_chats:
             break
 
@@ -673,6 +713,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user-id", action="append", default=[], help="only process this authorized user id/open_id; repeatable")
     parser.add_argument("--limit-users", type=int, default=0, help="process at most N authorized users")
     parser.add_argument("--limit-chats", type=int, default=0, help="process at most N target chats")
+    parser.add_argument(
+        "--active-since-days",
+        type=int,
+        default=int(os.getenv("EXTERNAL_GROUP_JOIN_ACTIVE_SINCE_DAYS", "30")),
+        help="only process chats with at least one message in the last N days (0 = disable). "
+             "Adds 1 API call per candidate but avoids joining dead groups.",
+    )
     parser.add_argument("--include-internal", action="store_true", help="also process internal chats (default: external chats only)")
     parser.add_argument("--apply", action="store_true", help="actually invite the bot (default: dry-run)")
     parser.add_argument("--sleep-seconds", type=float, default=float(os.getenv("EXTERNAL_GROUP_JOIN_SLEEP_SECONDS", "0.2")))
@@ -737,6 +784,7 @@ def main() -> int:
             include_internal=args.include_internal,
             limit_chats=args.limit_chats,
             fail_fast=args.fail_fast,
+            active_since_days=args.active_since_days,
         )
 
         print("\nSummary:")
@@ -744,7 +792,8 @@ def main() -> int:
             "  users={users} user_errors={user_errors} user_chats={user_chats} "
             "candidate_chats={candidate_chats} already_has_bot={already_has_bot} "
             "deduped={deduped} skipped_missing_scope={skipped_missing_scope} "
-            "skipped_expired={skipped_expired} targets={targets}".format(**stats)
+            "skipped_expired={skipped_expired} skipped_inactive={skipped_inactive} "
+            "targets={targets}".format(**stats)
         )
         if errors:
             print("  user error samples:")
