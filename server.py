@@ -254,6 +254,7 @@ JOB_FUNCS = {
     "bulk-stats-refresh": _job_bulk_refresh,
     "cf-prewarm": _job_cf_prewarm,
     "secondary-sync": lambda: _job_secondary_sync(),  # lazy ref，避免引用前定义问题
+    "primary-sync": lambda: _job_primary_sync(),
 }
 
 
@@ -324,6 +325,16 @@ def _start_scheduler() -> AsyncIOScheduler:
         _job_secondary_sync,
         IntervalTrigger(seconds=15),
         id="secondary-sync",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
+    )
+    # Primary Base 同步 worker：webhook 改写 SQLite 后由此异步推到旧 Base。
+    sch.add_job(
+        _job_primary_sync,
+        IntervalTrigger(seconds=10),
+        id="primary-sync",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
@@ -1399,6 +1410,111 @@ def _job_secondary_sync() -> None:
         )
 
 
+# ─── Primary Base 同步 worker（webhook 不再直写旧 Base，全走这里）──────────────
+
+def _sync_chats_to_primary(batch_size: int = 200) -> dict[str, int]:
+    state = _ensure_lark_state()
+    from sync_feishu_groups_to_base import CHAT_FIELD_DEFS, CHAT_TABLE_NAME
+    chat_table_id = state["table_ids"].get(CHAT_TABLE_NAME)
+    if not chat_table_id:
+        return {"synced": 0, "failed": 0, "skipped": 1}
+    pending = local_db.get_pending_chats_for_primary(limit=batch_size)
+    if not pending:
+        return {"synced": 0, "failed": 0, "skipped": 0}
+    field_names = [f["name"] for f in CHAT_FIELD_DEFS]
+    rows = [_build_chat_row_minimal(
+        p["chat_id"], p["name"], p["description"],
+        p["member_total"], p["owner_id"],
+    ) for p in pending]
+    try:
+        resp = state["client"].batch_create_records(state["base_token"], chat_table_id, field_names, rows)
+        new_ids = resp.get("record_id_list") or []
+        chat_to_rec = {p["chat_id"]: str(rid) for p, rid in zip(pending, new_ids) if rid}
+        marked = local_db.mark_chats_primary_synced(chat_to_rec)
+        # 维护内存 cache（webhook UPDATE 类还会用）
+        for cid, rid in chat_to_rec.items():
+            _chat_record_cache[cid] = rid
+        _sync_stats["chats_synced"] += marked
+        return {"synced": marked, "failed": 0, "skipped": 0}
+    except Exception as e:  # noqa: BLE001
+        err = str(e)[:300]
+        log.exception("[sync/primary] chat batch failed (size=%d): %s", len(pending), err)
+        local_db.bump_sync_failure("chats", "chat_id", [p["chat_id"] for p in pending], err)
+        _sync_stats["chats_failed"] += len(pending)
+        return {"synced": 0, "failed": len(pending), "skipped": 0}
+
+
+def _sync_messages_to_primary(batch_size: int = 200) -> dict[str, int]:
+    state = _ensure_lark_state()
+    from sync_feishu_groups_to_base import BASE_MESSAGE_FIELD_DEFS, MESSAGE_TABLE_NAME
+    msg_table_id = state["table_ids"].get(MESSAGE_TABLE_NAME)
+    if not msg_table_id:
+        return {"synced": 0, "failed": 0, "skipped": 1}
+    pending = local_db.get_pending_messages_for_primary(limit=batch_size)
+    if not pending:
+        return {"synced": 0, "failed": 0, "skipped": 0}
+    field_names = [f["name"] for f in BASE_MESSAGE_FIELD_DEFS]
+    rows = [_build_message_row_minimal(
+        p["chat_primary_record_id"], p["chat_id"], p["chat_name"],
+        p["msg_id"], p["sender_id"], p["sender_type"],
+        p["time_ms"] or 0, p["text"] or "", p["msg_type"] or "",
+        p["is_deleted"] or 0,
+    ) for p in pending]
+    try:
+        resp = state["client"].batch_create_records(state["base_token"], msg_table_id, field_names, rows)
+        new_ids = resp.get("record_id_list") or []
+        msg_to_rec = {p["msg_id"]: str(rid) for p, rid in zip(pending, new_ids) if rid}
+        marked = local_db.mark_messages_primary_synced(msg_to_rec)
+        _sync_stats["messages_synced"] += marked
+        return {"synced": marked, "failed": 0, "skipped": 0}
+    except Exception as e:  # noqa: BLE001
+        err = str(e)[:300]
+        log.exception("[sync/primary] message batch failed (size=%d): %s", len(pending), err)
+        local_db.bump_sync_failure("messages", "msg_id", [p["msg_id"] for p in pending], err)
+        _sync_stats["messages_failed"] += len(pending)
+        return {"synced": 0, "failed": len(pending), "skipped": 0}
+
+
+def _sync_members_to_primary(batch_size: int = 200) -> dict[str, int]:
+    state = _ensure_lark_state()
+    from sync_feishu_groups_to_base import BASE_MEMBER_FIELD_DEFS, MEMBER_TABLE_NAME
+    mem_table_id = state["table_ids"].get(MEMBER_TABLE_NAME)
+    if not mem_table_id:
+        return {"synced": 0, "failed": 0, "skipped": 1}
+    pending = local_db.get_pending_members_for_primary(limit=batch_size)
+    if not pending:
+        return {"synced": 0, "failed": 0, "skipped": 0}
+    field_names = [f["name"] for f in BASE_MEMBER_FIELD_DEFS]
+    rows = [_build_member_row_minimal(
+        p["chat_primary_record_id"], p["chat_id"], p["chat_name"],
+        p["member_open_id"], p["name"] or "", p["tenant_key"] or "",
+    ) for p in pending]
+    try:
+        resp = state["client"].batch_create_records(state["base_token"], mem_table_id, field_names, rows)
+        new_ids = resp.get("record_id_list") or []
+        items = [{"chat_id": p["chat_id"], "member_open_id": p["member_open_id"], "primary_record_id": str(rid)}
+                 for p, rid in zip(pending, new_ids) if rid]
+        marked = local_db.mark_members_primary_synced(items)
+        _sync_stats["members_synced"] += marked
+        return {"synced": marked, "failed": 0, "skipped": 0}
+    except Exception as e:  # noqa: BLE001
+        err = str(e)[:300]
+        log.exception("[sync/primary] member batch failed (size=%d): %s", len(pending), err)
+        local_db.bump_sync_failure("members", "chat_id", [p["chat_id"] for p in pending], err)
+        _sync_stats["members_failed"] += len(pending)
+        return {"synced": 0, "failed": len(pending), "skipped": 0}
+
+
+def _job_primary_sync() -> None:
+    """APScheduler 入口：webhook 写 SQLite 后由这里推到旧 Base。"""
+    _sync_stats["last_run_ts"] = int(time.time())
+    c = _sync_chats_to_primary()
+    m = _sync_messages_to_primary()
+    mb = _sync_members_to_primary()
+    if any(x["synced"] or x["failed"] for x in (c, m, mb)):
+        log.info("[sync/primary] tick chat=%s msg=%s member=%s", c, m, mb)
+
+
 def _refresh_chat_record_cache_if_stale() -> None:
     """Rebuild chat_id → record_id map from chat 表 (rate-limited)."""
     global _chat_record_cache_built_at
@@ -1478,15 +1594,8 @@ def _create_member_rows_safely(
 
 
 def _process_message_event(body: dict) -> None:
-    """im.message.receive_v1 → append 1 row to 「机器人群消息记录」."""
+    """im.message.receive_v1 → 只写 SQLite（primary_synced=0），sync worker 推到 Base。"""
     try:
-        from sync_feishu_groups_to_base import (
-            BASE_MESSAGE_FIELD_DEFS,
-            CHAT_TABLE_NAME,
-            MESSAGE_TABLE_NAME,
-            build_message_row,
-            materialize_field_defs,
-        )
         event = body.get("event") or {}
         msg = event.get("message") or {}
         sender = event.get("sender") or {}
@@ -1496,89 +1605,36 @@ def _process_message_event(body: dict) -> None:
             log.warning("[event/message] missing chat_id/message_id; skip")
             return
 
-        state = _ensure_lark_state()
-        msg_table_id = state["table_ids"].get(MESSAGE_TABLE_NAME)
-        chat_table_id = state["table_ids"].get(CHAT_TABLE_NAME)
-        if not msg_table_id or not chat_table_id:
-            log.warning("[event/message] tables not cached; skip")
-            return
-
-        _refresh_chat_record_cache_if_stale()
-        chat_record_id = _chat_record_cache.get(chat_id) or ""
-
-        # Convert webhook event → iter_messages-shaped dict (build_message_row's input)
-        synthetic_msg = {
-            "message_id": message_id,
-            "msg_type": msg.get("message_type"),
-            "create_time": msg.get("create_time"),
-            "update_time": msg.get("update_time"),
-            "chat_id": chat_id,
-            "body": {"content": msg.get("content")},
-            "sender": {
-                "id": (sender.get("sender_id") or {}).get("open_id"),
-                "id_type": "open_id",
-                "sender_type": sender.get("sender_type"),
-                "tenant_key": sender.get("tenant_key"),
-            },
-            "deleted": False,
-            "updated": False,
-            "thread_id": msg.get("thread_id"),
-            "root_id": msg.get("root_id"),
-            "parent_id": msg.get("parent_id"),
-        }
-
-        sync_run_id = "event-" + datetime.now(SYNC_TZ).strftime("%Y%m%d%H%M%S")
-        row = build_message_row(synthetic_msg, "", chat_record_id, sync_run_id, SYNC_TZ)
-        # 关联群组 link 在 BASE_MESSAGE_FIELD_DEFS 里是第 4 列（index 3）。
-        # 当 chat_record_id 为空（如 bot 刚加群，cache 还没更新），跳过 link，
-        # 否则 [{"id": ""}] 会被 Base 拒掉 invalid_request。
-        if not chat_record_id:
-            row[3] = None
-        message_field_defs = materialize_field_defs(BASE_MESSAGE_FIELD_DEFS, chat_table_id)
-        message_fields = [f["name"] for f in message_field_defs]
-        state["client"].batch_create_records(
-            state["base_token"], msg_table_id, message_fields, [row]
-        )
-        # Tier 1: 同步写本地 SQLite，让 dashboard 看到最新消息
         try:
+            ct = int(msg.get("create_time"))
+            time_ms = ct if ct > 10**12 else ct * 1000
+        except (TypeError, ValueError):
+            time_ms = int(time.time() * 1000)
+        content_obj = msg.get("content")
+        if isinstance(content_obj, str):
             try:
-                ct = int(msg.get("create_time"))
-                time_ms = ct if ct > 10**12 else ct * 1000
-            except (TypeError, ValueError):
-                time_ms = int(time.time() * 1000)
-            content_obj = msg.get("content")
-            if isinstance(content_obj, str):
-                try:
-                    content_obj = json.loads(content_obj)
-                except Exception:  # noqa: BLE001
-                    content_obj = None
-            text_val = (content_obj or {}).get("text") if isinstance(content_obj, dict) else None
-            local_db.upsert_message(
-                message_id, chat_id,
-                sender_id=(sender.get("sender_id") or {}).get("open_id"),
-                sender_type=sender.get("sender_type"),
-                time_ms=time_ms,
-                text=text_val or str(msg.get("content") or "")[:1000],
-                msg_type=msg.get("message_type"),
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("[event/message] local_db upsert failed (non-fatal)")
+                content_obj = json.loads(content_obj)
+            except Exception:  # noqa: BLE001
+                content_obj = None
+        text_val = (content_obj or {}).get("text") if isinstance(content_obj, dict) else None
+
+        local_db.upsert_message(
+            message_id, chat_id,
+            sender_id=(sender.get("sender_id") or {}).get("open_id"),
+            sender_type=sender.get("sender_type"),
+            time_ms=time_ms,
+            text=text_val or str(msg.get("content") or "")[:1000],
+            msg_type=msg.get("message_type"),
+        )
         _bump_persist_count("message")
-        log.info("[event/message] persisted msg=%s chat=%s record_id=%s", message_id, chat_id, chat_record_id or "(missing)")
+        log.info("[event/message] queued msg=%s chat=%s", message_id, chat_id)
     except Exception:
         log.exception("[event/message] failed")
 
 
 def _process_member_added_event(body: dict) -> None:
-    """im.chat.member.user.added_v1 → append member rows to 「机器人群成员记录」."""
+    """im.chat.member.user.added_v1 → 只写 SQLite（primary_synced=0），worker 推 Base。"""
     try:
-        from sync_feishu_groups_to_base import (
-            BASE_MEMBER_FIELD_DEFS,
-            CHAT_TABLE_NAME,
-            MEMBER_TABLE_NAME,
-            build_member_rows,
-            materialize_field_defs,
-        )
         event = body.get("event") or {}
         chat_id = event.get("chat_id") or ""
         chat_name = event.get("name") or ""
@@ -1587,48 +1643,19 @@ def _process_member_added_event(body: dict) -> None:
             log.warning("[event/member-add] missing chat_id/users; skip")
             return
 
-        state = _ensure_lark_state()
-        member_table_id = state["table_ids"].get(MEMBER_TABLE_NAME)
-        chat_table_id = state["table_ids"].get(CHAT_TABLE_NAME)
-        if not member_table_id or not chat_table_id:
-            log.warning("[event/member-add] tables not cached; skip")
-            return
-
-        _refresh_chat_record_cache_if_stale()
-        chat_record_id = _chat_record_cache.get(chat_id) or ""
-
-        # Convert event users → list_chat_members-shaped dicts
         members = []
         for u in users:
             uid = u.get("user_id") or {}
             members.append({
-                "member_id": uid.get("open_id") or "",
-                "member_id_type": "open_id",
+                "id": uid.get("open_id") or "",
                 "name": u.get("name") or "",
                 "tenant_key": u.get("tenant_key") or "",
             })
 
-        sync_run_id = "event-" + datetime.now(SYNC_TZ).strftime("%Y%m%d%H%M%S")
-        rows = build_member_rows(chat_id, chat_name, chat_record_id, members, sync_run_id)
-        if not rows:
-            return
-        member_field_defs = materialize_field_defs(BASE_MEMBER_FIELD_DEFS, chat_table_id)
-        _create_member_rows_safely(
-            state["client"], state["base_token"], member_table_id,
-            member_field_defs, rows, chat_record_id=chat_record_id,
-        )
-        # Tier 1: 双写本地 SQLite
-        try:
-            local_db.upsert_chat(chat_id, name=chat_name or None)
-            local_db.upsert_members_bulk(chat_id, [
-                {"id": m["member_id"], "name": m.get("name"), "tenant_key": m.get("tenant_key")}
-                for m in members
-            ])
-        except Exception:  # noqa: BLE001
-            log.exception("[event/member-add] local_db upsert failed (non-fatal)")
+        local_db.upsert_chat(chat_id, name=chat_name or None)
+        local_db.upsert_members_bulk(chat_id, members)
         _bump_persist_count("member-add")
-        log.info("[event/member-add] +%d users in chat %s (link=%s)",
-                 len(rows), chat_id, "yes" if chat_record_id else "dropped")
+        log.info("[event/member-add] queued +%d users chat=%s", len(members), chat_id)
     except Exception:
         log.exception("[event/member-add] failed")
 
@@ -1798,20 +1825,9 @@ def _process_chat_disbanded_event(body: dict) -> None:
 
 
 def _process_bot_added_event(body: dict) -> None:
-    """im.chat.member.bot.added_v1 → upsert chat row + write member rows + 24h message backfill."""
+    """im.chat.member.bot.added_v1 → 从 Lark API 抓 chat detail + 成员 + 24h 消息，全部
+    只写 SQLite（primary_synced=0）。两个 sync worker（primary + secondary）异步推到 Base。"""
     try:
-        from sync_feishu_groups_to_base import (
-            BASE_MEMBER_FIELD_DEFS,
-            BASE_MESSAGE_FIELD_DEFS,
-            CHAT_FIELDS,
-            CHAT_TABLE_NAME,
-            MEMBER_TABLE_NAME,
-            MESSAGE_TABLE_NAME,
-            build_chat_row,
-            build_member_rows,
-            build_message_row,
-            materialize_field_defs,
-        )
         event = body.get("event") or {}
         chat_id = event.get("chat_id") or ""
         chat_name = event.get("name") or ""
@@ -1821,12 +1837,8 @@ def _process_bot_added_event(body: dict) -> None:
 
         state = _ensure_lark_state()
         client = state["client"]
-        base_token = state["base_token"]
-        chat_table_id = state["table_ids"].get(CHAT_TABLE_NAME)
-        if not chat_table_id:
-            return
 
-        # 1) chat detail (best-effort; bot may not yet have full perms)
+        # 1) chat detail (best-effort)
         try:
             detail = client.get_chat_detail(chat_id)
         except Exception:
@@ -1841,64 +1853,24 @@ def _process_bot_added_event(body: dict) -> None:
             members = []
             member_total = 0
 
-        # 3) upsert chat row
-        sync_run_id = "event-bot-added-" + datetime.now(SYNC_TZ).strftime("%Y%m%d%H%M%S")
-        sync_time_text = datetime.now(SYNC_TZ).strftime("%Y-%m-%d %H:%M:%S")
-        chat_row = build_chat_row(
-            {"chat_id": chat_id, "name": chat_name, "external": external},
-            detail, {}, members, member_total,
-            sync_run_id, sync_time_text, SYNC_TZ,
-        )
-        existing_map = client.list_existing_record_ids_v1(base_token, chat_table_id, "群ID")
-        existing_rid = existing_map.get(chat_id)
-        if existing_rid:
-            client.batch_update_records_v1(base_token, chat_table_id, CHAT_FIELDS, [existing_rid], [chat_row])
-            chat_record_id = existing_rid
-        else:
-            result = client.batch_create_records(base_token, chat_table_id, CHAT_FIELDS, [chat_row])
-            new_ids = result.get("record_id_list") or []
-            chat_record_id = str(new_ids[0]) if new_ids else ""
-        if chat_record_id:
-            _chat_record_cache[chat_id] = chat_record_id
+        # 3) 24h messages backfill
+        now_ts = int(time.time())
+        start_ts = now_ts - 86400
+        try:
+            messages = list(client.iter_messages(
+                chat_id, page_size=50, start_time=start_ts, end_time=now_ts, max_messages=200,
+            ))
+        except Exception:
+            messages = []
 
-        # 4) member rows
-        if members and chat_record_id:
-            member_table_id = state["table_ids"].get(MEMBER_TABLE_NAME)
-            if member_table_id:
-                mfd = materialize_field_defs(BASE_MEMBER_FIELD_DEFS, chat_table_id)
-                m_rows = build_member_rows(chat_id, chat_name, chat_record_id, members, sync_run_id)
-                if m_rows:
-                    _create_member_rows_safely(
-                        client, base_token, member_table_id, mfd, m_rows,
-                        chat_record_id=chat_record_id,
-                    )
-
-        # 5) recent 24h messages backfill (best-effort; capped to 200 to keep handler bounded)
-        msg_count = 0
-        msg_table_id = state["table_ids"].get(MESSAGE_TABLE_NAME)
-        if msg_table_id and chat_record_id:
-            now_ts = int(time.time())
-            start_ts = now_ts - 86400
-            try:
-                messages = list(client.iter_messages(
-                    chat_id, page_size=50, start_time=start_ts, end_time=now_ts, max_messages=200,
-                ))
-            except Exception:
-                messages = []
-            if messages:
-                msfd = materialize_field_defs(BASE_MESSAGE_FIELD_DEFS, chat_table_id)
-                msg_fields = [f["name"] for f in msfd]
-                rows = [build_message_row(m, chat_name, chat_record_id, sync_run_id, SYNC_TZ) for m in messages]
-                client.batch_create_records(base_token, msg_table_id, msg_fields, rows)
-                msg_count = len(rows)
-
-        # Tier 1: 双写本地 SQLite（chat / members / 24h 消息全部写一遍）
+        # 4) 全部写 SQLite，worker 异步推 Base
         try:
             local_db.upsert_chat(
                 chat_id,
-                name=chat_name or None,
-                record_id=chat_record_id or None,
+                name=detail.get("name") or chat_name or None,
+                description=detail.get("description") or None,
                 member_total=member_total,
+                owner_id=detail.get("owner_id"),
             )
             if members:
                 local_db.upsert_members_bulk(chat_id, [
@@ -1938,11 +1910,12 @@ def _process_bot_added_event(body: dict) -> None:
                     })
                 local_db.upsert_messages_bulk(local_msgs)
         except Exception:  # noqa: BLE001
-            log.exception("[event/bot-added] local_db upsert failed (non-fatal)")
+            log.exception("[event/bot-added] local_db upsert failed")
+            return
 
         log.info(
-            "[event/bot-added] chat=%s name=%s members=%d msgs=%d",
-            chat_id, chat_name, len(members), msg_count,
+            "[event/bot-added] queued chat=%s name=%s members=%d msgs=%d",
+            chat_id, chat_name, len(members), len(messages),
         )
         _bump_persist_count("bot-added")
     except Exception:

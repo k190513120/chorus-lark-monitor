@@ -155,6 +155,141 @@ def _now_ts() -> int:
 
 # ─── sync queue helpers（给 Base sync worker 用） ──────────────────────────────
 
+def get_pending_chats_for_primary(limit: int = 200) -> List[Dict[str, Any]]:
+    init_db()
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT chat_id, name, description, chat_type_label, member_total, owner_id
+            FROM chats
+            WHERE primary_synced = 0
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_pending_messages_for_primary(limit: int = 200) -> List[Dict[str, Any]]:
+    init_db()
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT m.msg_id, m.chat_id, m.sender_id, m.sender_type, m.time_ms,
+                   m.text, m.msg_type, m.is_deleted, m.raw_event_json,
+                   c.record_id AS chat_primary_record_id,
+                   c.name AS chat_name
+            FROM messages m
+            JOIN chats c ON c.chat_id = m.chat_id
+            WHERE m.primary_synced = 0
+              AND c.record_id IS NOT NULL
+            ORDER BY m.time_ms ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_pending_members_for_primary(limit: int = 200) -> List[Dict[str, Any]]:
+    init_db()
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT mb.chat_id, mb.member_open_id, mb.name, mb.tenant_key,
+                   c.record_id AS chat_primary_record_id,
+                   c.name AS chat_name
+            FROM members mb
+            JOIN chats c ON c.chat_id = mb.chat_id
+            WHERE mb.primary_synced = 0
+              AND c.record_id IS NOT NULL
+            ORDER BY mb.updated_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_chats_primary_synced(chat_to_record_id: Dict[str, str]) -> int:
+    if not chat_to_record_id:
+        return 0
+    init_db()
+    conn = connect()
+    n = 0
+    try:
+        for chat_id, rec_id in chat_to_record_id.items():
+            cur = conn.execute(
+                """
+                UPDATE chats
+                SET record_id = ?, primary_synced = 1, sync_attempts = 0, sync_last_error = NULL
+                WHERE chat_id = ?
+                """,
+                (rec_id, chat_id),
+            )
+            n += cur.rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def mark_messages_primary_synced(msg_to_record_id: Dict[str, str]) -> int:
+    if not msg_to_record_id:
+        return 0
+    init_db()
+    conn = connect()
+    n = 0
+    try:
+        for msg_id, rec_id in msg_to_record_id.items():
+            cur = conn.execute(
+                """
+                UPDATE messages
+                SET primary_record_id = ?, primary_synced = 1, sync_attempts = 0, sync_last_error = NULL
+                WHERE msg_id = ?
+                """,
+                (rec_id, msg_id),
+            )
+            n += cur.rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def mark_members_primary_synced(items: List[Dict[str, str]]) -> int:
+    if not items:
+        return 0
+    init_db()
+    conn = connect()
+    n = 0
+    try:
+        for it in items:
+            cur = conn.execute(
+                """
+                UPDATE members
+                SET primary_record_id = ?, primary_synced = 1, sync_attempts = 0, sync_last_error = NULL
+                WHERE chat_id = ? AND member_open_id = ?
+                """,
+                (it["primary_record_id"], it["chat_id"], it["member_open_id"]),
+            )
+            n += cur.rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
 def get_pending_chats_for_secondary(limit: int = 200) -> List[Dict[str, Any]]:
     init_db()
     conn = connect()
@@ -320,6 +455,9 @@ def get_sync_queue_stats() -> Dict[str, int]:
     try:
         out = {}
         for tbl in ("chats", "messages", "members"):
+            out[f"{tbl}_pending_primary"] = conn.execute(
+                f"SELECT COUNT(*) FROM {tbl} WHERE primary_synced = 0"
+            ).fetchone()[0]
             out[f"{tbl}_pending_secondary"] = conn.execute(
                 f"SELECT COUNT(*) FROM {tbl} WHERE secondary_synced = 0"
             ).fetchone()[0]
