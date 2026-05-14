@@ -135,19 +135,27 @@ def text_value(v) -> str:
 
 
 def list_all_records(token: str, app: str, table: str, page_size: int = 500) -> list:
-    """分页列出表所有行。"""
+    """分页列出表所有行。
+
+    Lark Base 大表（> 50k）走 GET /records 会报 1254103 RecordExceedLimit，
+    必须改用 POST /records/search（同样支持分页）。"""
     out: list = []
     page_token = ""
+    pages = 0
     while True:
-        path = f"/open-apis/bitable/v1/apps/{app}/tables/{table}/records?page_size={page_size}"
+        path = f"/open-apis/bitable/v1/apps/{app}/tables/{table}/records/search?page_size={page_size}"
+        body = {"page_size": page_size}
         if page_token:
-            path += f"&page_token={urllib.parse.quote(page_token)}"
-        d = api(token, "GET", path)
+            body["page_token"] = page_token
+        d = api(token, "POST", path, body=body)
         if int(d.get("code", -1)) != 0:
-            raise RuntimeError(f"list failed: {d}")
+            raise RuntimeError(f"search failed: {d}")
         data = d.get("data", {})
         items = data.get("items", [])
         out.extend(items)
+        pages += 1
+        if pages % 10 == 0:
+            sys.stdout.write(f"      ...{len(out)} 行 ({pages} 页)\n"); sys.stdout.flush()
         if not data.get("has_more"):
             break
         page_token = data.get("page_token", "")
