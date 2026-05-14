@@ -81,25 +81,38 @@ def get_token() -> str:
         return json.loads(resp.read())["tenant_access_token"]
 
 
+TRANSIENT_BODY_CODES = ("1254607", "800004135", "800004136")
+
+
 def api(token: str, method: str, path: str, body: dict | None = None) -> dict:
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        f"{LARK_OPEN}{path}",
-        data=data,
-        method=method,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    )
     last_err = None
-    for attempt in range(3):
+    for attempt in range(5):
+        req = urllib.request.Request(
+            f"{LARK_OPEN}{path}",
+            data=data,
+            method=method,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read())
+                d = json.loads(resp.read())
+            if any(c in str(d.get("code", "")) for c in TRANSIENT_BODY_CODES):
+                sleep_s = 1.0 * (2 ** attempt)
+                sys.stdout.write(f"    transient code {d.get('code')}, retry in {sleep_s}s ({attempt+1}/5)\n"); sys.stdout.flush()
+                time.sleep(sleep_s)
+                last_err = f"transient code {d.get('code')}"
+                continue
+            return d
         except urllib.error.HTTPError as e:
             body_text = e.read().decode("utf-8", errors="ignore")
             last_err = f"HTTP {e.code}: {body_text[:300]}"
-            # 限频 retry
             if e.code in (429, 500, 502, 503, 504):
-                sleep_s = 0.5 * (2 ** attempt)
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            if e.code == 400 and any(c in body_text for c in TRANSIENT_BODY_CODES):
+                sleep_s = 1.0 * (2 ** attempt)
+                sys.stdout.write(f"    HTTP 400 transient, retry in {sleep_s}s ({attempt+1}/5)\n"); sys.stdout.flush()
                 time.sleep(sleep_s)
                 continue
             raise RuntimeError(f"{method} {path}: {last_err}")
