@@ -196,23 +196,14 @@ def backfill_table(token: str, base_label: str, app: str, table: str, spec: dict
 
     for r in records:
         f = r.get("fields", {})
-        # 已经有 user 值就跳过
         if f.get(user_field):
             skip_has_user += 1
             continue
-        # 提取 ID
+        # 用 ou_ 前缀判定是否 open_id；不依赖独立的 id_type 字段
+        # （消息表的 发送者类型 字段值是 "user" / "app" / 空，不是 "open_id"）
         open_id = text_value(f.get(id_field))
         if not open_id or not open_id.startswith("ou_"):
             skip_no_id += 1
-            continue
-        # 验证 ID 类型
-        if id_type_field:
-            id_type = text_value(f.get(id_type_field))
-            if id_type and id_type != "open_id":
-                skip_wrong_id_type += 1
-                continue
-        elif id_type_value and id_type_value != "open_id":
-            skip_wrong_id_type += 1
             continue
         to_update.append({
             "record_id": r["record_id"],
