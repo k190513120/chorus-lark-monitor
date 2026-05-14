@@ -138,16 +138,16 @@ def list_all_records(token: str, app: str, table: str, page_size: int = 500) -> 
     """分页列出表所有行。
 
     Lark Base 大表（> 50k）走 GET /records 会报 1254103 RecordExceedLimit，
-    必须改用 POST /records/search（同样支持分页）。"""
+    必须改用 POST /records/search。注意 page_token 必须放 **query string**
+    不是 body，否则每页返回同一批数据。"""
     out: list = []
     page_token = ""
     pages = 0
     while True:
         path = f"/open-apis/bitable/v1/apps/{app}/tables/{table}/records/search?page_size={page_size}"
-        body = {"page_size": page_size}
         if page_token:
-            body["page_token"] = page_token
-        d = api(token, "POST", path, body=body)
+            path += f"&page_token={urllib.parse.quote(page_token)}"
+        d = api(token, "POST", path, body={})
         if int(d.get("code", -1)) != 0:
             raise RuntimeError(f"search failed: {d}")
         data = d.get("data", {})
