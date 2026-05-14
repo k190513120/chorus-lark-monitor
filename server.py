@@ -193,6 +193,12 @@ def _job_daily_sync() -> int:
 
 
 def _job_external_join() -> int:
+    # 紧急 kill switch：EXTERNAL_JOIN_DISABLED=true 时直接跳过。
+    # 2026-05-14：一次 cron 拉了 24k 群，cron pool 被堵 14h，
+    # 设这个开关方便临时停手。
+    if os.getenv("EXTERNAL_JOIN_DISABLED", "").lower() in ("1", "true", "yes"):
+        log.warning("[job/external-join] DISABLED via env, skipping")
+        return 0
     return _run_script(
         "ensure_bot_in_external_chats",
         ["--apply", "--allow-chat-failures"],
