@@ -1200,6 +1200,9 @@ def _build_chat_row_minimal(chat_id: str, name: str, description: str,
             row.append(str(member_total) if member_total else "")
         elif n == "群主ID":
             row.append(owner_id or "")
+        elif n == "群主" and f.get("type") == "user":
+            # user 类型字段必须用 [{"id": open_id}] 格式，否则 Base UI 显示空
+            row.append([{"id": owner_id}] if owner_id else None)
         elif n == "同步批次":
             row.append("secondary-sync-backfill")
         elif n == "同步时间":
@@ -1286,6 +1289,12 @@ def _build_message_row_minimal(chat_record_id_secondary: str, chat_id: str, chat
             row.append(sender_id or "")
         elif n == "发送者类型":
             row.append(sender_type or "")
+        elif n == "发送者" and ftype == "user":
+            # 仅当 sender_type 是 open_id 才填 user cell（app_id/union_id 无法被 Base 解析）
+            if sender_id and sender_type == "open_id":
+                row.append([{"id": sender_id}])
+            else:
+                row.append(None)
         elif n == "是否已删除":
             row.append("是" if is_deleted else "否")
         elif n == "消息内容":
@@ -1351,6 +1360,9 @@ def _build_member_row_minimal(chat_record_id_secondary: str, chat_id: str, chat_
             row.append(member_open_id or "")
         elif n == "成员ID类型":
             row.append("open_id")
+        elif n == "成员" and ftype == "user":
+            # user 类型必须填 [{"id": open_id}]，否则 Base UI 显示空
+            row.append([{"id": member_open_id}] if member_open_id else None)
         elif n == "成员姓名":
             row.append(name or "")
         elif n == "成员租户Key":
