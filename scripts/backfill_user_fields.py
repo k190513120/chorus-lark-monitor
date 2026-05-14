@@ -81,7 +81,7 @@ def get_token() -> str:
         return json.loads(resp.read())["tenant_access_token"]
 
 
-TRANSIENT_BODY_CODES = ("1254607", "800004135", "800004136")
+TRANSIENT_BODY_CODES = ("1254607", "1255002", "800004135", "800004136")
 
 
 def api(token: str, method: str, path: str, body: dict | None = None) -> dict:
