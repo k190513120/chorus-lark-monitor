@@ -55,24 +55,29 @@ def extract_text(cell) -> str:
 
 
 def list_all_records(client: FeishuClient, app_token: str, table_id: str, field_names: Optional[List[str]] = None) -> List[Dict]:
+    """分页列表所有记录。
+
+    Lark Base 的 GET /records 在表 > 50k 行时返回 1254103 RecordExceedLimit，
+    必须改用 POST /records/search。注意 page_token 要放在 query string 不是 body，
+    否则会循环返回第一页。field_names 也走 body。"""
     records: List[Dict] = []
     page_token: Optional[str] = None
     while True:
-        params: Dict[str, object] = {"page_size": 500}
+        body: Dict[str, object] = {"page_size": 500}
         if field_names:
-            params["field_names"] = json.dumps(field_names, ensure_ascii=False)
+            body["field_names"] = field_names
+        params: Dict[str, object] = {"page_size": 500}
         if page_token:
             params["page_token"] = page_token
         try:
             data = client.request(
-                "GET",
-                f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+                "POST",
+                f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
                 params=params,
+                data=body,
             )
         except FeishuAPIError as exc:
-            # Lark Base list endpoint caps at ~50k records per query; once a table
-            # exceeds that we get code=1254103 RecordExceedLimit. Return whatever
-            # we got so the dashboard build keeps going.
+            # 如果仍然撞限制（不太可能），返回已拿到的部分。
             msg = str(exc)
             if "1254103" in msg or "RecordExceedLimit" in msg:
                 print(

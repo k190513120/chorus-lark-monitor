@@ -793,7 +793,19 @@ def upload_image_to_block(token, block_id, svg_bytes, name="chart.svg"):
         raise
     if int(d.get("code", -1)) != 0:
         raise RuntimeError(f"upload failed: {d}")
-    return d["data"]["file_token"]
+    file_token = d["data"]["file_token"]
+
+    # 关键：upload_all 不会自动把 file_token 写回 image block，
+    # 必须显式 PATCH replace_image。否则 Docx 渲染时 token=空 → 图打不开
+    patch_resp = api(
+        "PATCH",
+        f"/open-apis/docx/v1/documents/{DOC_ID}/blocks/{block_id}",
+        token,
+        body={"replace_image": {"token": file_token}},
+    )
+    if int(patch_resp.get("code", -1)) != 0:
+        raise RuntimeError(f"PATCH replace_image failed: {patch_resp}")
+    return file_token
 
 
 def main():
