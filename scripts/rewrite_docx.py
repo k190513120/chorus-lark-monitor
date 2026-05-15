@@ -70,6 +70,11 @@ def image_placeholder():
     return {"block_type": 27, "image": {"token": ""}}
 
 
+def board_placeholder():
+    """飞书原生画板块（block_type=43）。先创建空板，拿到 board.token 后往里塞 svg node。"""
+    return {"block_type": 43, "board": {"align": 1}}
+
+
 SVG_STYLE = """
   .box { stroke-width: 1.5; }
   .label { font-family: -apple-system, "PingFang SC", sans-serif; font-size: 14px; fill: #111827; }
@@ -754,6 +759,42 @@ def insert_image_block(token):
     return d["data"]["children"][0]["block_id"]
 
 
+def insert_board_with_svg(token, svg_xml, viewbox_w=1280, viewbox_h=720):
+    """创建飞书原生画板块（block_type=43）+ 注入一个 svg node。
+
+    流程：
+      1) POST docx blocks/children 加 block_type=43 → 拿到 board.token (即 whiteboard_token)
+      2) POST board/v1/whiteboards/{token}/nodes 加一个 type=svg + svg_code 的节点
+    返回 (docx_block_id, whiteboard_token)
+    """
+    d = api("POST",
+            f"/open-apis/docx/v1/documents/{DOC_ID}/blocks/{DOC_ID}/children",
+            token, body={"children": [board_placeholder()], "index": -1})
+    if int(d.get("code", -1)) != 0:
+        raise RuntimeError(f"create board block failed: {d}")
+    child = d["data"]["children"][0]
+    block_id = child["block_id"]
+    wb_token = child["board"]["token"]
+
+    # POST svg node 到画板
+    node_body = {
+        "nodes": [{
+            "type": "svg",
+            "x": 0,
+            "y": 0,
+            "width": viewbox_w,
+            "height": viewbox_h,
+            "svg": {"svg_code": svg_xml},
+        }]
+    }
+    resp = api("POST",
+               f"/open-apis/board/v1/whiteboards/{wb_token}/nodes",
+               token, body=node_body)
+    if int(resp.get("code", -1)) != 0:
+        raise RuntimeError(f"create svg node failed: {resp}")
+    return block_id, wb_token
+
+
 def upload_image_to_block(token, block_id, svg_bytes, name="chart.svg"):
     boundary = "----chorus" + str(int(time.time()))
     parts = []
@@ -833,10 +874,14 @@ def main():
             written_text += len(it["data"])
             print(f"  [{i+1}/{len(items)}] +{len(it['data'])} blocks (text_total={written_text})", flush=True)
         else:
-            block_id = insert_image_block(token)
-            file_token = upload_image_to_block(token, block_id, it["svg"], it["name"])
+            # 走画板 svg node（user 期望）。viewbox 从 svg 字符串解析
+            svg_str = it["svg"].decode("utf-8")
+            import re
+            mw = re.search(r'viewBox="0\s+0\s+(\d+)\s+(\d+)"', svg_str)
+            vw, vh = (int(mw.group(1)), int(mw.group(2))) if mw else (1280, 720)
+            block_id, wb_token = insert_board_with_svg(token, svg_str, viewbox_w=vw, viewbox_h=vh)
             img_idx += 1
-            print(f"  [{i+1}/{len(items)}] image #{img_idx} {it['name']} (block={block_id} file={file_token[:20]}...)", flush=True)
+            print(f"  [{i+1}/{len(items)}] board #{img_idx} {it['name']} (block={block_id} wb={wb_token[:20]}... viewbox={vw}x{vh})", flush=True)
 
     print(f"\n[3/3] done. open: https://bytedance.larkoffice.com/docx/{DOC_ID}", flush=True)
     return 0
