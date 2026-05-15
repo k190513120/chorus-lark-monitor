@@ -1,78 +1,25 @@
 #!/usr/bin/env python3
-"""Chorus Docx 完整重写脚本（V3：反映 2026-05-15 状态）。
+"""Chorus Docx 完整重写脚本（V4：使用 scripts/lark_docx.py 库）。
 
-变化对比 V2：
-- 旧 Base 已停写，新 Base 是唯一 source of truth
-- chats 49.9k / msgs 72k / members 106k (external-join 一夜入 24k 群)
-- secondary-sync worker 已 disabled
-- EXTERNAL_JOIN_DISABLED kill switch
-- user 字段 builder bug + 42k 回填
-- Lark Base /records LIST 在 >50k 行报 1254103，改用 /records/search
-- ID 转换探索状态（fsopen wrapper / Kitex / TQS）
+只保留项目相关内容（SVG 字符串 + 章节 build_doc_items）。所有 Lark API /
+画板 / 上传 boilerplate 都在 lark_docx.py 里。
+
+Run:
+    set -a; source .env; set +a
+    .venv/bin/python scripts/rewrite_docx.py
 """
-from __future__ import annotations
-
-import json
 import os
 import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
+
+# 让本目录里的 lark_docx 能 import
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lark_docx import (
+    LarkDocxClient,
+    h, p, bullet, code, divider,
+    text_item, svg_item,
+)
 
 DOC_ID = os.getenv("CHORUS_DOC_ID", "VqlCdpASboikidxVuTMcth1rnAh")
-LARK_OPEN = "https://open.feishu.cn"
-
-
-def lark_token() -> str:
-    req = urllib.request.Request(
-        f"{LARK_OPEN}/open-apis/auth/v3/tenant_access_token/internal",
-        data=json.dumps({"app_id": os.environ["LARK_APP_ID"], "app_secret": os.environ["LARK_APP_SECRET"]}).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())["tenant_access_token"]
-
-
-def api(method: str, path: str, token: str, body: dict | None = None) -> dict:
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        f"{LARK_OPEN}{path}",
-        data=data, method=method,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        msg = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"{method} {path} -> HTTP {e.code}: {msg[:500]}") from e
-
-
-def h(level, text):
-    btype = {1: 3, 2: 4, 3: 5, 4: 6}[level]
-    return {"block_type": btype, f"heading{level}": {"elements": [{"text_run": {"content": text}}], "style": {}}}
-
-
-def p(text):
-    return {"block_type": 2, "text": {"elements": [{"text_run": {"content": text}}], "style": {}}}
-
-
-def bullet(text):
-    return {"block_type": 12, "bullet": {"elements": [{"text_run": {"content": text}}], "style": {}}}
-
-
-def divider():
-    return {"block_type": 22, "divider": {}}
-
-
-def image_placeholder():
-    return {"block_type": 27, "image": {"token": ""}}
-
-
-def board_placeholder():
-    """飞书原生画板块（block_type=43）。先创建空板，拿到 board.token 后往里塞 svg node。"""
-    return {"block_type": 43, "board": {"align": 1}}
 
 
 SVG_STYLE = """
@@ -84,7 +31,6 @@ SVG_STYLE = """
   .label-mono-md { font-family: "JetBrains Mono", monospace; font-size: 13px; fill: #1f2937; }
   .section-title { font-family: -apple-system, sans-serif; font-weight: 700; font-size: 13px; fill: #111827; }
 """
-
 
 ARCH_SVG = f"""<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
@@ -198,7 +144,6 @@ ARCH_SVG = f"""<?xml version="1.0" encoding="UTF-8"?>
 </svg>
 """
 
-
 CRON_SVG = f"""<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 480" width="1280" height="480">
   <style>{SVG_STYLE}
@@ -267,7 +212,6 @@ CRON_SVG = f"""<?xml version="1.0" encoding="UTF-8"?>
 </svg>
 """
 
-
 ENDPOINTS_SVG = f"""<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 460" width="1280" height="460">
   <style>{SVG_STYLE}
@@ -325,7 +269,6 @@ ENDPOINTS_SVG = f"""<?xml version="1.0" encoding="UTF-8"?>
   <text class="label-sm" x="40" y="410">admin 路径只在本机 127.0.0.1:5678 可达</text>
 </svg>
 """
-
 
 ENV_SVG = f"""<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 540" width="1280" height="540">
@@ -401,7 +344,6 @@ ENV_SVG = f"""<?xml version="1.0" encoding="UTF-8"?>
   <text class="label-sm" x="150" y="529">可选（有默认值）</text>
 </svg>
 """
-
 
 FILES_SVG = f"""<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 660" width="1280" height="660">
@@ -516,24 +458,15 @@ FILES_SVG = f"""<?xml version="1.0" encoding="UTF-8"?>
 </svg>
 """
 
-
-def items_text(blocks):
-    return {"type": "blocks", "data": blocks}
-
-
-def items_image(svg, name="chart.svg"):
-    return {"type": "image", "svg": svg.encode("utf-8"), "name": name}
-
-
 def build_doc_items():
     items = []
 
-    items.append(items_text([
+    items.append(text_item([
         h(1, "Chorus Lark Monitor · 飞书群聊监控系统"),
         p("把飞书群聊的消息 / 成员变更 / 群事件实时汇聚到 SQLite 真源 + 新 Base 写入，给客户运营提供「DR · 客户对话健康度」面板。"),
     ]))
 
-    items.append(items_text([
+    items.append(text_item([
         h(2, "一、Chorus 是什么"),
         p("Mac mini 本机部署的飞书机器人群聊监控平台。bot 自动加入授权用户的外部群，实时捕获消息事件，聚合后给客户经理 / 主管看「群健康度看板」。"),
         h(3, "现状（2026-05-15）"),
@@ -545,19 +478,19 @@ def build_doc_items():
         bullet("dual-write 阶段已结束，迁移完成（2026-05-14）"),
     ]))
 
-    items.append(items_text([
+    items.append(text_item([
         h(2, "二、整体架构"),
         p("数据从飞书出发，经过 CF Worker + tunnel 进入本机 server.py，落到 SQLite 真源，由 primary-sync worker 异步推送到新 Base。dashboard 直读 SQLite，绕开 Base API 限频。"),
     ]))
-    items.append(items_image(ARCH_SVG, "arch.svg"))
-    items.append(items_text([
+    items.append(svg_item(ARCH_SVG, "arch.svg"))
+    items.append(text_item([
         h(3, "三段职责"),
         bullet("Webhook 入站：5ms 内只写 SQLite，飞书 webhook 永不超时"),
         bullet("后台 sync worker：异步把 SQLite 行批量推到新 Base，失败可重试可监控"),
         bullet("Dashboard 读路径：SQLite 直读，绕过 Base 全部限频"),
     ]))
 
-    items.append(items_text([
+    items.append(text_item([
         h(2, "三、SQLite 真源（chorus_local.db）"),
         p("本机持久层 ~83 MB，WAL 模式支持并发读 + 单写。所有 Base 数据从这里 fanout。"),
         h(3, "4 张表"),
@@ -572,7 +505,7 @@ def build_doc_items():
         p("2026-05-14 迁移时做过列翻转：原 record_id（旧 Base）与 secondary_record_id（新 Base）交换，让 primary 路径指向新 Base。"),
     ]))
 
-    items.append(items_text([
+    items.append(text_item([
         h(2, "四、Webhook 事件处理"),
         p("server.py 暴露 POST /lark/events。事件分两类：CREATE 类异步走 SQLite + worker，UPDATE/DELETE 类同步操作 Base 已有 record_id（量小）。"),
         h(3, "CREATE 类（异步入 SQLite，worker 推 Base）"),
@@ -589,7 +522,7 @@ def build_doc_items():
         bullet("SQLite WAL 单写者自动 serialize，无写冲突"),
     ]))
 
-    items.append(items_text([
+    items.append(text_item([
         h(2, "五、多维表格（新 Base 唯一写入）"),
         h(3, "新 Base · Helix · 项目门户（PRIMARY）"),
         bullet("token: G42ybVmN9aAeYdsHW06cysTonmF"),
@@ -605,9 +538,9 @@ def build_doc_items():
         bullet("Base /records GET API 在表 >50k 行时报 1254103 RecordExceedLimit；改用 POST /records/search，page_token 放 query string"),
     ]))
 
-    items.append(items_text([h(2, "六、定时任务（APScheduler）")]))
-    items.append(items_image(CRON_SVG, "cron.svg"))
-    items.append(items_text([
+    items.append(text_item([h(2, "六、定时任务（APScheduler）")]))
+    items.append(svg_item(CRON_SVG, "cron.svg"))
+    items.append(text_item([
         h(3, "daily-sync 详解"),
         bullet("调用 sync_feishu_groups_to_base.py，参数 --scheduled-daily --lite-mode --refresh-metadata-tables"),
         bullet("--lite-mode 下不会重建表，只增量 upsert（确认过对新 Base 安全）"),
@@ -619,7 +552,7 @@ def build_doc_items():
         bullet("如需重启：.env 删 EXTERNAL_JOIN_DISABLED + 重启 server.py"),
     ]))
 
-    items.append(items_text([
+    items.append(text_item([
         h(2, "七、公网部署（CF Worker + Tunnel）"),
         h(3, "Cloudflare 资源"),
         bullet("Account: Kelan656691@gmail.com (acct 2e2b291e8f3e011ca7824f19bcb77236)"),
@@ -636,7 +569,7 @@ def build_doc_items():
         bullet("KV namespace GROUP_JOIN_TOKENS 存用户 token；secret GROUP_JOIN_ADMIN_TOKEN 鉴权"),
     ]))
 
-    items.append(items_text([
+    items.append(text_item([
         h(2, "八、Dashboard 前端"),
         p("地址：https://chorus.xiaomiao.win/"),
         bullet("前端栈：React 18 UMD（unpkg）+ Babel standalone + JSX 源码"),
@@ -645,9 +578,9 @@ def build_doc_items():
         bullet("已知瓶颈：Google Fonts + unpkg.com 境外 CDN 首访 3-5s 主要花在这里"),
     ]))
 
-    items.append(items_text([h(2, "九、运维 / 监控")]))
-    items.append(items_image(ENDPOINTS_SVG, "endpoints.svg"))
-    items.append(items_text([
+    items.append(text_item([h(2, "九、运维 / 监控")]))
+    items.append(svg_item(ENDPOINTS_SVG, "endpoints.svg"))
+    items.append(text_item([
         h(3, "日志文件"),
         bullet("~/chorus-lark-monitor/logs/server.err.log — server.py 主日志"),
         bullet("~/chorus-lark-monitor/logs/server.out.log — uvicorn 访问日志 + 脚本 stdout"),
@@ -658,13 +591,13 @@ def build_doc_items():
         p("plist 在 deployment/ 下，launchctl unload / load 重启。"),
     ]))
 
-    items.append(items_text([h(2, "十、关键配置（.env）")]))
-    items.append(items_image(ENV_SVG, "env.svg"))
+    items.append(text_item([h(2, "十、关键配置（.env）")]))
+    items.append(svg_item(ENV_SVG, "env.svg"))
 
-    items.append(items_text([h(2, "十一、关键代码文件")]))
-    items.append(items_image(FILES_SVG, "files.svg"))
+    items.append(text_item([h(2, "十一、关键代码文件")]))
+    items.append(svg_item(FILES_SVG, "files.svg"))
 
-    items.append(items_text([
+    items.append(text_item([
         h(2, "十二、踩过的坑（按时间倒序）"),
         bullet("Lark Base /records GET API 在表 >50k 行时报 1254103 RecordExceedLimit → 改用 /records/search（page_token 必须在 query string 不是 body）"),
         bullet("_build_*_row_minimal 给 user 类型字段填 None，导致 3 张表的 群主/成员/发送者 字段全空 → 修后回填 42.8k 历史行"),
@@ -678,7 +611,7 @@ def build_doc_items():
         bullet("daily-sync --refresh-metadata-tables 重建表后旧 table_id 失效 → daily-sync 完成后 _invalidate_lark_state() + 重 seed 本地 SQLite"),
     ]))
 
-    items.append(items_text([
+    items.append(text_item([
         h(2, "十三、待办 / 后续演进"),
         h(3, "ID 转换接入（tenant_key → tenant_id F 码）"),
         bullet("当前可用：fsopen.bytedance.net/exchange/v3/ 已实测通，支持 open_id ↔ lark_id / message_id / chat_id 四类"),
@@ -697,193 +630,13 @@ def build_doc_items():
     return items
 
 
-def list_existing_children(token):
-    out = []
-    page_token = ""
-    while True:
-        path = f"/open-apis/docx/v1/documents/{DOC_ID}/blocks/{DOC_ID}/children?page_size=500"
-        if page_token:
-            path += f"&page_token={page_token}"
-        d = api("GET", path, token)
-        data = d.get("data", {})
-        items = data.get("items") or data.get("children") or []
-        out.extend(items)
-        if not data.get("has_more"):
-            break
-        page_token = data.get("page_token", "")
-        if not page_token:
-            break
-    return out
-
-
-def delete_all_children(token):
-    children = list_existing_children(token)
-    n = len(children)
-    print(f"  found {n} existing children", flush=True)
-    if n == 0:
-        return 0
-    chunk = 100
-    deleted = 0
-    while deleted < n:
-        end = n - deleted
-        start = max(end - chunk, 0)
-        d = api("DELETE",
-                f"/open-apis/docx/v1/documents/{DOC_ID}/blocks/{DOC_ID}/children/batch_delete",
-                token, body={"start_index": start, "end_index": end})
-        if int(d.get("code", -1)) != 0:
-            raise RuntimeError(f"delete failed: {d}")
-        deleted += (end - start)
-        print(f"  deleted {deleted}/{n}", flush=True)
-        time.sleep(0.3)
-    return n
-
-
-def append_blocks(token, blocks, chunk=20):
-    new_ids = []
-    for start in range(0, len(blocks), chunk):
-        batch = blocks[start : start + chunk]
-        d = api("POST",
-                f"/open-apis/docx/v1/documents/{DOC_ID}/blocks/{DOC_ID}/children",
-                token, body={"children": batch, "index": -1})
-        if int(d.get("code", -1)) != 0:
-            raise RuntimeError(f"append failed: {d}")
-        new_ids.extend(c["block_id"] for c in d["data"].get("children", []))
-        time.sleep(0.3)
-    return new_ids
-
-
-def insert_image_block(token):
-    d = api("POST",
-            f"/open-apis/docx/v1/documents/{DOC_ID}/blocks/{DOC_ID}/children",
-            token, body={"children": [image_placeholder()], "index": -1})
-    return d["data"]["children"][0]["block_id"]
-
-
-def insert_board_with_svg(token, svg_xml, viewbox_w=1280, viewbox_h=720):
-    """创建飞书原生画板块（block_type=43）+ 注入一个 svg node。
-
-    流程：
-      1) POST docx blocks/children 加 block_type=43 → 拿到 board.token (即 whiteboard_token)
-      2) POST board/v1/whiteboards/{token}/nodes 加一个 type=svg + svg_code 的节点
-    返回 (docx_block_id, whiteboard_token)
-    """
-    d = api("POST",
-            f"/open-apis/docx/v1/documents/{DOC_ID}/blocks/{DOC_ID}/children",
-            token, body={"children": [board_placeholder()], "index": -1})
-    if int(d.get("code", -1)) != 0:
-        raise RuntimeError(f"create board block failed: {d}")
-    child = d["data"]["children"][0]
-    block_id = child["block_id"]
-    wb_token = child["board"]["token"]
-
-    # POST svg node 到画板
-    node_body = {
-        "nodes": [{
-            "type": "svg",
-            "x": 0,
-            "y": 0,
-            "width": viewbox_w,
-            "height": viewbox_h,
-            "svg": {"svg_code": svg_xml},
-        }]
-    }
-    resp = api("POST",
-               f"/open-apis/board/v1/whiteboards/{wb_token}/nodes",
-               token, body=node_body)
-    if int(resp.get("code", -1)) != 0:
-        raise RuntimeError(f"create svg node failed: {resp}")
-    return block_id, wb_token
-
-
-def upload_image_to_block(token, block_id, svg_bytes, name="chart.svg"):
-    boundary = "----chorus" + str(int(time.time()))
-    parts = []
-    def add(field_name, val):
-        if isinstance(val, (int, float)):
-            val = str(val)
-        if isinstance(val, str):
-            val = val.encode()
-        parts.extend([
-            f"--{boundary}".encode(),
-            f'Content-Disposition: form-data; name="{field_name}"'.encode(),
-            b"", val,
-        ])
-    add("file_name", name)
-    add("parent_type", "docx_image")
-    add("parent_node", block_id)
-    add("size", len(svg_bytes))
-    add("extra", json.dumps({"drive_route_token": DOC_ID}))
-    parts.extend([
-        f"--{boundary}".encode(),
-        f'Content-Disposition: form-data; name="file"; filename="{name}"'.encode(),
-        b"Content-Type: image/svg+xml", b"", svg_bytes,
-    ])
-    parts.append(f"--{boundary}--".encode())
-    body = b"\r\n".join(parts)
-    req = urllib.request.Request(
-        f"{LARK_OPEN}/open-apis/drive/v1/medias/upload_all",
-        data=body, method="POST",
-        headers={"Authorization": f"Bearer {token}",
-                 "Content-Type": f"multipart/form-data; boundary={boundary}"},
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            d = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        print("HTTPError:", e.code, e.read().decode("utf-8", errors="ignore")[:600], flush=True)
-        raise
-    if int(d.get("code", -1)) != 0:
-        raise RuntimeError(f"upload failed: {d}")
-    file_token = d["data"]["file_token"]
-
-    # 关键：upload_all 不会自动把 file_token 写回 image block，
-    # 必须显式 PATCH replace_image。否则 Docx 渲染时 token=空 → 图打不开
-    patch_resp = api(
-        "PATCH",
-        f"/open-apis/docx/v1/documents/{DOC_ID}/blocks/{block_id}",
-        token,
-        body={"replace_image": {"token": file_token}},
-    )
-    if int(patch_resp.get("code", -1)) != 0:
-        raise RuntimeError(f"PATCH replace_image failed: {patch_resp}")
-    return file_token
-
 
 def main():
     if not (os.environ.get("LARK_APP_ID") and os.environ.get("LARK_APP_SECRET")):
         print("ERR: need LARK_APP_ID / LARK_APP_SECRET", file=sys.stderr)
         return 2
-
-    token = lark_token()
-    print(f"target doc: {DOC_ID}", flush=True)
-
-    print("\n[1/3] deleting existing blocks...", flush=True)
-    n = delete_all_children(token)
-    print(f"      removed {n} blocks", flush=True)
-
-    items = build_doc_items()
-    text_total = sum(len(it['data']) for it in items if it['type']=='blocks')
-    img_total = sum(1 for it in items if it['type']=='image')
-    print(f"\n[2/3] writing {len(items)} items ({text_total} text blocks + {img_total} SVG images)...", flush=True)
-
-    img_idx = 0
-    written_text = 0
-    for i, it in enumerate(items):
-        if it["type"] == "blocks":
-            append_blocks(token, it["data"])
-            written_text += len(it["data"])
-            print(f"  [{i+1}/{len(items)}] +{len(it['data'])} blocks (text_total={written_text})", flush=True)
-        else:
-            # 走画板 svg node（user 期望）。viewbox 从 svg 字符串解析
-            svg_str = it["svg"].decode("utf-8")
-            import re
-            mw = re.search(r'viewBox="0\s+0\s+(\d+)\s+(\d+)"', svg_str)
-            vw, vh = (int(mw.group(1)), int(mw.group(2))) if mw else (1280, 720)
-            block_id, wb_token = insert_board_with_svg(token, svg_str, viewbox_w=vw, viewbox_h=vh)
-            img_idx += 1
-            print(f"  [{i+1}/{len(items)}] board #{img_idx} {it['name']} (block={block_id} wb={wb_token[:20]}... viewbox={vw}x{vh})", flush=True)
-
-    print(f"\n[3/3] done. open: https://bytedance.larkoffice.com/docx/{DOC_ID}", flush=True)
+    doc = LarkDocxClient.from_env(DOC_ID)
+    doc.write(build_doc_items(), mode="rewrite")
     return 0
 
 
