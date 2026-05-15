@@ -199,9 +199,17 @@ def _job_external_join() -> int:
     if os.getenv("EXTERNAL_JOIN_DISABLED", "").lower() in ("1", "true", "yes"):
         log.warning("[job/external-join] DISABLED via env, skipping")
         return 0
+    args = ["--apply", "--allow-chat-failures"]
+    # 活跃度过滤：默认 30 天没消息的群不拉。可用 EXTERNAL_JOIN_ACTIVE_SINCE_DAYS=0 关掉。
+    active_days = os.getenv("EXTERNAL_JOIN_ACTIVE_SINCE_DAYS", "30")
+    try:
+        if int(active_days) > 0:
+            args.extend(["--active-since-days", str(int(active_days))])
+    except ValueError:
+        log.warning("[job/external-join] invalid EXTERNAL_JOIN_ACTIVE_SINCE_DAYS=%r, using no filter", active_days)
     return _run_script(
         "ensure_bot_in_external_chats",
-        ["--apply", "--allow-chat-failures"],
+        args,
         "external-join",
     )
 
