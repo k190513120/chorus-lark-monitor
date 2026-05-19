@@ -104,6 +104,11 @@ def encode_params(params: Optional[Dict[str, object]]) -> str:
     return urllib.parse.urlencode(clean, doseq=True)
 
 
+# 临时网关错误：值得长 backoff 重试（不是客户端 bug）
+# 408 Request Timeout, 429 Too Many Requests, 5xx Server Errors
+_RETRYABLE_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
 def http_json(
     method: str,
     url: str,
@@ -112,7 +117,7 @@ def http_json(
     data: Optional[Dict[str, object]] = None,
     bearer_token: str = "",
     timeout: int = 60,
-    retries: int = 3,
+    retries: int = 5,
 ) -> Dict[str, object]:
     query = encode_params(params)
     if query:
@@ -132,6 +137,7 @@ def http_json(
 
     last_error: Optional[BaseException] = None
     for attempt in range(1, retries + 1):
+        retryable = True  # 网络/socket 错误默认值得重试
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method=method)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -140,11 +146,15 @@ def http_json(
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             last_error = FeishuAPIError(f"HTTP {exc.code}: {detail[:500]}")
+            retryable = exc.code in _RETRYABLE_HTTP_CODES
         except Exception as exc:  # noqa: BLE001
             last_error = exc
 
+        if not retryable:
+            break  # 4xx 客户端错误，重试无意义
         if attempt < retries:
-            time.sleep(min(2 ** (attempt - 1), 5))
+            # backoff: 2, 4, 8, 16, 30s — 给上游 ~1 min 时间恢复
+            time.sleep(min(2 ** attempt, 30))
 
     raise last_error or RuntimeError(f"{method} {url} failed")
 
